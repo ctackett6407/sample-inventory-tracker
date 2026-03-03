@@ -1,10 +1,10 @@
 # app.py
 # Sample Inventory + Content Tracker (CSV-backed) with:
+# - Contacts system (contacts.csv) including WhatsApp
 # - Controlled dropdowns for concentration/type and size (avoid human error)
-# - Contacts system (contacts.csv) with a Contacts tab and inventory-by-contact views
-# - Brand Contact label (renamed from contact handle) + optional selection from contacts
-# - "Who shipped it" becomes a dropdown tied to Contacts (still stores display name)
-# - Guardrails for empty brand/perfume filters (prevents IndexError)
+# - Posting updates UI (mark posted + URLs) by UPC
+# - Inventory update + safe delete tools
+# - Catalog overrides (catalog_overrides.csv) to add/correct catalog entries without editing fra_cleaned.csv
 
 import os
 import re
@@ -21,6 +21,7 @@ import streamlit as st
 # ----------------------------
 DEFAULT_SAMPLES_CSV = "samples.csv"
 DEFAULT_CATALOG_CSV = "data/fra_cleaned.csv"
+DEFAULT_CATALOG_OVERRIDES_CSV = "catalog_overrides.csv"
 DEFAULT_ACTIVITY_LOG_CSV = "activity_log.csv"
 DEFAULT_CONTACTS_CSV = "contacts.csv"
 
@@ -30,7 +31,6 @@ STATUS_POSTED = "POSTED"
 STATUS_COMPLETE = "COMPLETE"
 ALL_STATUSES = [STATUS_NEW, STATUS_FILMED, STATUS_POSTED, STATUS_COMPLETE]
 
-# Controlled options (avoid typing)
 CONCENTRATION_OPTIONS = [
     "Unknown",
     "EDP",
@@ -77,28 +77,23 @@ CONTACT_TYPE_OPTIONS = [
     "Other",
 ]
 
-# Samples schema
 SAMPLES_FIELDS = [
-    # identity + basics
     "upc",
     "brand",
     "product_name",
 
-    # controlled fields
     "concentration",
     "size",
-    "variant",  # kept for backward compatibility; we will auto-build it from concentration+size
+    "variant",
 
-    # shipping / relationship
     "source_contact_id",
     "source_shipper",
     "brand_contact_id",
-    "contact_handle",  # label shown as "Brand Contact" for user
+    "contact_handle",
 
     "received_date",
     "batch_id",
 
-    # workflow
     "status",
     "tiktok_posted",
     "tiktok_url",
@@ -107,7 +102,6 @@ SAMPLES_FIELDS = [
     "amazon_posted",
     "amazon_url",
 
-    # fragrance metadata (from catalog)
     "fragrance_url",
     "country",
     "gender",
@@ -125,12 +119,11 @@ SAMPLES_FIELDS = [
     "perfumer1",
     "perfumer2",
 
-    # misc
     "notes",
     "last_updated",
 ]
 
-# Contacts schema
+# Contacts schema (NOW includes whatsapp)
 CONTACT_FIELDS = [
     "contact_id",
     "name",
@@ -139,11 +132,34 @@ CONTACT_FIELDS = [
     "handle",
     "email",
     "phone",
+    "whatsapp",
     "notes",
     "last_updated",
 ]
 
 LOG_FIELDS = ["timestamp", "action", "upc_raw", "upc_normalized", "message"]
+
+# Normalized catalog schema used inside the app
+CATALOG_FIELDS = [
+    "url",
+    "perfume",
+    "brand",
+    "country",
+    "gender",
+    "rating_value",
+    "rating_count",
+    "year",
+    "top_notes",
+    "middle_notes",
+    "base_notes",
+    "perfumer1",
+    "perfumer2",
+    "main_accord_1",
+    "main_accord_2",
+    "main_accord_3",
+    "main_accord_4",
+    "main_accord_5",
+]
 
 
 # ----------------------------
@@ -192,6 +208,22 @@ def build_variant(concentration: str, size: str, conc_other: str = "", size_othe
 def ensure_csv(path: str, columns: List[str]) -> None:
     if not os.path.exists(path):
         pd.DataFrame(columns=columns).to_csv(path, index=False)
+        return
+
+    # Backfill missing columns for existing files (migration-safe)
+    try:
+        df = pd.read_csv(path, dtype=str).fillna("")
+        changed = False
+        for c in columns:
+            if c not in df.columns:
+                df[c] = ""
+                changed = True
+        if changed:
+            df = df[columns].copy()
+            df.to_csv(path, index=False)
+    except Exception:
+        # If file exists but can't be read, don't overwrite
+        pass
 
 
 def log_event(activity_log_path: str, action: str, upc_raw: str, upc_norm: str, message: str) -> None:
@@ -222,18 +254,14 @@ def load_samples(path: str) -> pd.DataFrame:
         if c not in df.columns:
             df[c] = ""
 
-    # normalize booleans
     for col in ["tiktok_posted", "instagram_posted", "amazon_posted"]:
         df[col] = df[col].apply(normalize_bool01)
 
-    # normalize UPC
     df["upc"] = df["upc"].astype(str).apply(normalize_upc)
 
-    # ensure controlled fields exist and attempt to backfill variant if empty
     df["concentration"] = df["concentration"].replace("", "Unknown")
     df["size"] = df["size"].replace("", "Unknown")
 
-    # If variant empty but concentration/size present, build it; if concentration/size empty, leave variant as-is
     def _rebuild_variant(r):
         v = safe_str(r.get("variant", "")).strip()
         c = safe_str(r.get("concentration", "")).strip() or "Unknown"
@@ -293,8 +321,73 @@ def compute_status(row: pd.Series, track_amazon: bool) -> str:
     return STATUS_NEW
 
 
+def get_upc_row_indexes(df: pd.DataFrame, upc_norm: str) -> List[int]:
+    if not upc_norm:
+        return []
+    return df.index[df["upc"] == upc_norm].tolist()
+
+
+def apply_catalog_to_session(crow: Dict[str, str]) -> None:
+    st.session_state["af_brand"] = pretty_slug(crow.get("brand", ""))
+    st.session_state["af_product_name"] = pretty_slug(crow.get("perfume", "")) or crow.get("perfume", "")
+
+    st.session_state["af_fragrance_url"] = crow.get("url", "")
+    st.session_state["af_country"] = crow.get("country", "")
+    st.session_state["af_gender"] = crow.get("gender", "")
+    st.session_state["af_year"] = safe_str(crow.get("year", "")).strip()
+
+    st.session_state["af_top_notes"] = crow.get("top_notes", "")
+    st.session_state["af_middle_notes"] = crow.get("middle_notes", "")
+    st.session_state["af_base_notes"] = crow.get("base_notes", "")
+
+    st.session_state["af_main_accord_1"] = crow.get("main_accord_1", "")
+    st.session_state["af_main_accord_2"] = crow.get("main_accord_2", "")
+    st.session_state["af_main_accord_3"] = crow.get("main_accord_3", "")
+    st.session_state["af_main_accord_4"] = crow.get("main_accord_4", "")
+    st.session_state["af_main_accord_5"] = crow.get("main_accord_5", "")
+
+    st.session_state["af_rating_value"] = crow.get("rating_value", "")
+    st.session_state["af_rating_count"] = crow.get("rating_count", "")
+
+    st.session_state["af_perfumer1"] = crow.get("perfumer1", "")
+    st.session_state["af_perfumer2"] = crow.get("perfumer2", "")
+
+
+def clear_autofill() -> None:
+    keys = [k for k in list(st.session_state.keys()) if k.startswith("af_")]
+    for k in keys:
+        del st.session_state[k]
+
+
+def contact_display_row(r: pd.Series) -> str:
+    name = safe_str(r.get("name", "")).strip()
+    ctype = safe_str(r.get("contact_type", "")).strip()
+    handle = safe_str(r.get("handle", "")).strip()
+    bits = [name]
+    if ctype:
+        bits.append(ctype)
+    if handle:
+        bits.append(handle)
+    return " • ".join([b for b in bits if b])
+
+
+def normalize_catalog_df(df: pd.DataFrame) -> pd.DataFrame:
+    # ensure all catalog fields exist
+    out = df.copy()
+    for c in CATALOG_FIELDS:
+        if c not in out.columns:
+            out[c] = ""
+    out = out[CATALOG_FIELDS].fillna("").copy()
+
+    out["brand"] = out["brand"].astype(str).str.strip()
+    out["perfume"] = out["perfume"].astype(str).str.strip()
+    out["url"] = out["url"].astype(str).str.strip()
+    out["rating_value"] = out["rating_value"].astype(str).str.replace(",", ".", regex=False).str.strip()
+    return out[(out["brand"].str.len() > 0) & (out["perfume"].str.len() > 0)].copy()
+
+
 @st.cache_data
-def load_catalog(path: str) -> Optional[pd.DataFrame]:
+def load_base_catalog_semicolon(path: str) -> Optional[pd.DataFrame]:
     if not os.path.exists(path):
         return None
 
@@ -306,6 +399,7 @@ def load_catalog(path: str) -> Optional[pd.DataFrame]:
         dtype=str,
     ).fillna("")
 
+    # map likely column names
     def find_col(*candidates):
         existing = {c.lower(): c for c in df.columns}
         for cand in candidates:
@@ -359,89 +453,38 @@ def load_catalog(path: str) -> Optional[pd.DataFrame]:
     out["main_accord_4"] = df[col_a4] if col_a4 else ""
     out["main_accord_5"] = df[col_a5] if col_a5 else ""
 
-    out["brand"] = out["brand"].astype(str).str.strip()
-    out["perfume"] = out["perfume"].astype(str).str.strip()
-    out["url"] = out["url"].astype(str).str.strip()
-    out["rating_value"] = out["rating_value"].astype(str).str.replace(",", ".", regex=False).str.strip()
-
-    out["brand_display"] = out["brand"].apply(pretty_slug)
-    out["perfume_display"] = out["perfume"].apply(pretty_slug)
-
-    out = out[(out["brand"].str.len() > 0) & (out["perfume"].str.len() > 0)].copy()
-    return out
+    return normalize_catalog_df(out)
 
 
-def get_upc_row_indexes(df: pd.DataFrame, upc_norm: str) -> List[int]:
-    if not upc_norm:
-        return []
-    return df.index[df["upc"] == upc_norm].tolist()
+def load_catalog_overrides(path: str) -> pd.DataFrame:
+    # overrides are regular comma CSV
+    ensure_csv(path, CATALOG_FIELDS)
+    df = pd.read_csv(path, dtype=str).fillna("")
+    return normalize_catalog_df(df)
 
 
-def apply_catalog_to_session(crow: Dict[str, str]) -> None:
-    st.session_state["af_brand"] = pretty_slug(crow.get("brand", ""))
-    st.session_state["af_product_name"] = crow.get("perfume_display", "")
-
-    st.session_state["af_fragrance_url"] = crow.get("url", "")
-    st.session_state["af_country"] = crow.get("country", "")
-    st.session_state["af_gender"] = crow.get("gender", "")
-    st.session_state["af_year"] = safe_str(crow.get("year", "")).strip()
-
-    st.session_state["af_top_notes"] = crow.get("top_notes", "")
-    st.session_state["af_middle_notes"] = crow.get("middle_notes", "")
-    st.session_state["af_base_notes"] = crow.get("base_notes", "")
-
-    st.session_state["af_main_accord_1"] = crow.get("main_accord_1", "")
-    st.session_state["af_main_accord_2"] = crow.get("main_accord_2", "")
-    st.session_state["af_main_accord_3"] = crow.get("main_accord_3", "")
-    st.session_state["af_main_accord_4"] = crow.get("main_accord_4", "")
-    st.session_state["af_main_accord_5"] = crow.get("main_accord_5", "")
-
-    st.session_state["af_rating_value"] = crow.get("rating_value", "")
-    st.session_state["af_rating_count"] = crow.get("rating_count", "")
-
-    st.session_state["af_perfumer1"] = crow.get("perfumer1", "")
-    st.session_state["af_perfumer2"] = crow.get("perfumer2", "")
+def save_catalog_overrides(df: pd.DataFrame, path: str) -> None:
+    for c in CATALOG_FIELDS:
+        if c not in df.columns:
+            df[c] = ""
+    df = normalize_catalog_df(df)
+    df.to_csv(path, index=False)
 
 
-def clear_autofill() -> None:
-    keys = [k for k in list(st.session_state.keys()) if k.startswith("af_")]
-    for k in keys:
-        del st.session_state[k]
+def merge_catalog(base_df: Optional[pd.DataFrame], overrides_df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    if base_df is None and overrides_df is None:
+        return None
+    if base_df is None:
+        return overrides_df.copy()
+
+    merged = pd.concat([base_df.copy(), overrides_df.copy()], ignore_index=True)
+    # overrides win: keep last by (brand, perfume)
+    merged["_key"] = (merged["brand"].str.lower().str.strip() + "||" + merged["perfume"].str.lower().str.strip())
+    merged = merged.drop_duplicates(subset=["_key"], keep="last").drop(columns=["_key"])
+    return merged
 
 
-def set_add_form_from_existing(row: pd.Series) -> None:
-    st.session_state["add_upc_raw"] = row.get("upc", "")
-    st.session_state["add_brand"] = row.get("brand", "")
-    st.session_state["add_product_name"] = row.get("product_name", "")
-    st.session_state["add_concentration"] = row.get("concentration", "Unknown") or "Unknown"
-    st.session_state["add_size"] = row.get("size", "Unknown") or "Unknown"
-    st.session_state["add_variant"] = row.get("variant", "")
-    st.session_state["add_batch_id"] = row.get("batch_id", "")
-    st.session_state["add_source_contact_id"] = row.get("source_contact_id", "")
-    st.session_state["add_source_shipper"] = row.get("source_shipper", "")
-    st.session_state["add_brand_contact_id"] = row.get("brand_contact_id", "")
-    st.session_state["add_brand_contact_text"] = row.get("contact_handle", "")
-    st.session_state["add_notes"] = row.get("notes", "")
-
-    st.session_state["af_fragrance_url"] = row.get("fragrance_url", "")
-    st.session_state["af_country"] = row.get("country", "")
-    st.session_state["af_gender"] = row.get("gender", "")
-    st.session_state["af_year"] = row.get("year", "")
-    st.session_state["af_top_notes"] = row.get("top_notes", "")
-    st.session_state["af_middle_notes"] = row.get("middle_notes", "")
-    st.session_state["af_base_notes"] = row.get("base_notes", "")
-    st.session_state["af_main_accord_1"] = row.get("main_accord_1", "")
-    st.session_state["af_main_accord_2"] = row.get("main_accord_2", "")
-    st.session_state["af_main_accord_3"] = row.get("main_accord_3", "")
-    st.session_state["af_main_accord_4"] = row.get("main_accord_4", "")
-    st.session_state["af_main_accord_5"] = row.get("main_accord_5", "")
-    st.session_state["af_rating_value"] = row.get("rating_value", "")
-    st.session_state["af_rating_count"] = row.get("rating_count", "")
-    st.session_state["af_perfumer1"] = row.get("perfumer1", "")
-    st.session_state["af_perfumer2"] = row.get("perfumer2", "")
-
-
-def update_existing_by_upc(
+def update_item_by_upc(
     df: pd.DataFrame,
     samples_path: str,
     activity_log_path: str,
@@ -468,20 +511,8 @@ def update_existing_by_upc(
     df.at[idx, "last_updated"] = now_str()
 
     save_samples(df, samples_path)
-    log_event(activity_log_path, "UPDATE_EXISTING", upc_raw, upc_norm, "Updated existing UPC row from Add/Receive.")
+    log_event(activity_log_path, "UPDATE_BY_UPC", upc_raw, upc_norm, "Updated item by UPC.")
     return df
-
-
-def contact_display_row(r: pd.Series) -> str:
-    name = safe_str(r.get("name", "")).strip()
-    ctype = safe_str(r.get("contact_type", "")).strip()
-    handle = safe_str(r.get("handle", "")).strip()
-    bits = [name]
-    if ctype:
-        bits.append(ctype)
-    if handle:
-        bits.append(handle)
-    return " • ".join([b for b in bits if b])
 
 
 # ----------------------------
@@ -495,19 +526,21 @@ with st.sidebar:
     samples_path = st.text_input("Samples CSV path", value=DEFAULT_SAMPLES_CSV)
     contacts_path = st.text_input("Contacts CSV path", value=DEFAULT_CONTACTS_CSV)
     activity_log_path = st.text_input("Activity log CSV path", value=DEFAULT_ACTIVITY_LOG_CSV)
-    st.caption("This app reads and writes to CSV files in your repo runtime.")
+
+    st.subheader("Catalog")
+    catalog_path = st.text_input("Base catalog path (read-only)", value=DEFAULT_CATALOG_CSV)
+    catalog_overrides_path = st.text_input("Catalog overrides path (editable)", value=DEFAULT_CATALOG_OVERRIDES_CSV)
 
     st.subheader("Platforms")
     track_amazon = st.toggle("Track Amazon postings", value=True)
 
-    st.subheader("Catalog (Brand → Perfume Autofill)")
-    catalog_path = st.text_input("Catalog CSV path", value=DEFAULT_CATALOG_CSV)
-    st.caption("Uses your dataset file stored in the repo (not a live website connection).")
-
 samples_df = load_samples(samples_path)
 contacts_df = load_contacts(contacts_path)
-catalog_df = load_catalog(catalog_path)
 ensure_csv(activity_log_path, LOG_FIELDS)
+
+base_catalog_df = load_base_catalog_semicolon(catalog_path)
+overrides_df = load_catalog_overrides(catalog_overrides_path)
+catalog_df = merge_catalog(base_catalog_df, overrides_df)
 
 if "activity_log" not in st.session_state:
     try:
@@ -515,50 +548,40 @@ if "activity_log" not in st.session_state:
     except Exception:
         st.session_state["activity_log"] = []
 
-# Contact lookup maps
 contacts_df_sorted = contacts_df.sort_values(by=["name", "contact_type"], ascending=[True, True]).copy()
 contact_id_to_name = {safe_str(r["contact_id"]): safe_str(r["name"]) for _, r in contacts_df_sorted.iterrows()}
 contact_options = ["(None)"] + contacts_df_sorted["contact_id"].tolist()
+contact_label_map = {"(None)": "(None)"}
+for _, r in contacts_df_sorted.iterrows():
+    contact_label_map[safe_str(r["contact_id"])] = contact_display_row(r)
 
 
 # ----------------------------
-# Quick Scan / Search
+# Quick Scan / Lookup
 # ----------------------------
-st.subheader("Quick Scan / Search")
-q1, q2, q3 = st.columns([2.2, 2.2, 5.6])
+st.subheader("Quick Scan / Lookup")
 
-with q1:
-    scan_upc_raw = st.text_input(
-        "Scan or paste UPC",
-        value=st.session_state.get("scan_upc_raw", ""),
-        placeholder="Click here, scan barcode",
-        help="Your scanner types like a keyboard. Click the box then scan.",
-    )
+c1, c2, c3 = st.columns([2.2, 2.2, 5.6])
+with c1:
+    scan_upc_raw = st.text_input("Scan or paste UPC", value=st.session_state.get("scan_upc_raw", ""), placeholder="Click here, scan barcode")
     st.session_state["scan_upc_raw"] = scan_upc_raw
     scan_upc_norm = normalize_upc(scan_upc_raw)
 
-with q2:
-    search_text = st.text_input(
-        "Search inventory",
-        value=st.session_state.get("search_text", ""),
-        placeholder="Brand, product, shipper, contact, notes…",
-    ).strip()
+with c2:
+    search_text = st.text_input("Search inventory", value=st.session_state.get("search_text", ""), placeholder="Brand, product, shipper, notes…").strip()
     st.session_state["search_text"] = search_text
 
-with q3:
-    st.caption(
-        "If a scanned UPC is new, go to **Add / Receive** and it will prefill the UPC. "
-        "If it exists, you will see the matching record and can fix it without losing your work."
-    )
+with c3:
+    st.caption("Use Add / Receive to add new UPCs. Use Posting Updates to mark posted + add URLs.")
 
 scan_hits = get_upc_row_indexes(samples_df, scan_upc_norm)
-
 if scan_upc_raw and not scan_upc_norm:
     st.warning("Your scan contained no digits. Try scanning again.")
 elif scan_upc_norm and not scan_hits:
-    st.info("UPC not found. Use **Add / Receive** to add it and associate it to a fragrance.")
+    st.info("UPC not found. Go to **Add / Receive** to add it.")
 elif scan_upc_norm and scan_hits:
-    st.success(f"UPC found ({len(scan_hits)} match). You can edit it in **Inventory** or update it in **Content Queue**.")
+    st.success(f"UPC found ({len(scan_hits)} match). You can update it from **Posting Updates** or **Inventory Admin**.")
+
 
 filtered_df = samples_df.copy()
 if search_text:
@@ -574,8 +597,9 @@ if search_text:
     ).str.lower()
     filtered_df = filtered_df[hay.str.contains(q, na=False)].copy()
 
-tab_dash, tab_add, tab_queue, tab_inventory, tab_contacts, tab_catalog, tab_log = st.tabs(
-    ["Dashboard", "Add / Receive", "Content Queue", "Inventory", "Contacts", "Catalog Browser", "Activity Log"]
+
+tab_dash, tab_add, tab_post, tab_inventory, tab_contacts, tab_catalog, tab_log = st.tabs(
+    ["Dashboard", "Add / Receive", "Posting Updates", "Inventory Admin", "Contacts", "Catalog", "Activity Log"]
 )
 
 
@@ -584,7 +608,6 @@ tab_dash, tab_add, tab_queue, tab_inventory, tab_contacts, tab_catalog, tab_log 
 # ----------------------------
 with tab_dash:
     st.subheader("Dashboard")
-
     total = len(samples_df)
     open_items = int((samples_df["status"] != STATUS_COMPLETE).sum()) if total else 0
     needs_filming = int((samples_df["status"] == STATUS_NEW).sum()) if total else 0
@@ -606,12 +629,9 @@ with tab_dash:
     m4.metric("Needs posting", needs_post)
 
     st.divider()
-    st.subheader("Recommended next actions")
-
     focus = samples_df[samples_df.apply(needs_posting, axis=1)].copy()
     focus = focus.sort_values(by=["received_date", "brand", "product_name"], ascending=[False, True, True])
-
-    if len(focus) == 0:
+    if focus.empty:
         st.write("No items are waiting on posting.")
     else:
         st.dataframe(
@@ -626,20 +646,14 @@ with tab_dash:
 # ----------------------------
 with tab_add:
     st.subheader("Add / Receive")
-    st.caption("Use dropdowns as much as possible to avoid typos. Notes are the only free text fields by design.")
-
     left, right = st.columns([1.05, 1])
 
     with left:
-        st.markdown("### Step 1: Pick the fragrance (autofill)")
-        if catalog_df is None:
-            st.warning("Catalog not loaded. Confirm the file exists at: data/fra_cleaned.csv")
+        st.markdown("### Step 1: Pick fragrance from catalog (autofill)")
+        if catalog_df is None or catalog_df.empty:
+            st.warning("Catalog not loaded. Confirm data/fra_cleaned.csv exists and/or add entries in Catalog overrides.")
         else:
-            brand_filter = st.text_input(
-                "Brand filter (optional)",
-                value=st.session_state.get("brand_filter", ""),
-                placeholder="Type to narrow brands…"
-            ).strip().lower()
+            brand_filter = st.text_input("Brand filter (optional)", value=st.session_state.get("brand_filter", ""), placeholder="Type to narrow brands…").strip().lower()
             st.session_state["brand_filter"] = brand_filter
 
             brands = sorted(catalog_df["brand"].unique().tolist())
@@ -647,56 +661,41 @@ with tab_add:
                 brands = [b for b in brands if brand_filter in b.lower()]
 
             if not brands:
-                st.info("No brands match your filter. Try fewer words, or clear the brand filter.")
+                st.info("No brands match your filter. Clear it or add to Catalog overrides.")
                 st.stop()
 
-            selected_brand = st.selectbox(
-                "Brand",
-                options=brands,
-                format_func=pretty_slug,
-                key="catalog_brand_select"
-            )
-
+            selected_brand = st.selectbox("Brand", options=brands, format_func=pretty_slug)
             brand_df = catalog_df[catalog_df["brand"] == selected_brand].copy()
             if brand_df.empty:
-                st.info("That brand has no perfumes in the dataset. Try another brand.")
+                st.info("No perfumes for this brand in catalog. Add via Catalog overrides.")
                 st.stop()
 
-            perfume_filter = st.text_input(
-                "Perfume filter (optional)",
-                value=st.session_state.get("perfume_filter", ""),
-                placeholder="Type to narrow perfumes…"
-            ).strip().lower()
+            perfume_filter = st.text_input("Perfume filter (optional)", value=st.session_state.get("perfume_filter", ""), placeholder="Type to narrow perfumes…").strip().lower()
             st.session_state["perfume_filter"] = perfume_filter
 
-            perfumes = brand_df["perfume_display"].tolist()
+            perfumes = sorted(brand_df["perfume"].unique().tolist())
             if perfume_filter:
                 perfumes = [p for p in perfumes if perfume_filter in p.lower()]
 
             if not perfumes:
-                st.info("No perfumes match your filter for this brand. Clear the perfume filter or try fewer words.")
+                st.info("No perfumes match. Clear perfume filter or add to overrides.")
                 st.stop()
 
-            selected_perfume_display = st.selectbox(
-                "Perfume",
-                options=perfumes,
-                key="catalog_perfume_select"
-            )
-
-            picked_df = brand_df[brand_df["perfume_display"] == selected_perfume_display].copy()
+            selected_perfume = st.selectbox("Perfume", options=perfumes, format_func=pretty_slug)
+            picked_df = brand_df[brand_df["perfume"] == selected_perfume].copy()
             if picked_df.empty:
-                st.info("That perfume selection was not found. Please reselect.")
+                st.info("Selection not found. Reselect.")
                 st.stop()
 
             picked_row = picked_df.iloc[0].to_dict()
 
-            cta1, cta2 = st.columns([1, 1])
-            with cta1:
+            a1, a2 = st.columns([1, 1])
+            with a1:
                 if st.button("Use this fragrance to autofill", type="primary"):
                     apply_catalog_to_session(picked_row)
-                    log_event(activity_log_path, "AUTOFILL", "", "", f"Selected {pretty_slug(picked_row.get('brand',''))} - {picked_row.get('perfume_display','')}")
-                    st.success("Autofill applied. Complete Step 2 on the right.")
-            with cta2:
+                    log_event(activity_log_path, "AUTOFILL", "", "", f"Selected {pretty_slug(picked_row.get('brand',''))} - {pretty_slug(picked_row.get('perfume',''))}")
+                    st.success("Autofill applied.")
+            with a2:
                 if st.button("Clear autofill"):
                     clear_autofill()
                     st.info("Autofill cleared.")
@@ -704,7 +703,7 @@ with tab_add:
             with st.expander("Preview details", expanded=False):
                 st.write({
                     "Brand": pretty_slug(picked_row.get("brand", "")),
-                    "Perfume": picked_row.get("perfume_display", ""),
+                    "Perfume": pretty_slug(picked_row.get("perfume", "")),
                     "Year": picked_row.get("year", ""),
                     "Gender": picked_row.get("gender", ""),
                     "Top notes": picked_row.get("top_notes", ""),
@@ -723,14 +722,12 @@ with tab_add:
 
     with right:
         st.markdown("### Step 2: Scan UPC, confirm, and save")
-        st.caption("Key fields are dropdowns. If a UPC conflict happens, you can inspect and fix it without losing your work.")
+        st.caption("If you hit a UPC conflict, you can inspect it and choose to update the existing record instead.")
 
-        # Prefill UPC from scan if new
         default_upc_raw = st.session_state.get("add_upc_raw", "")
         if scan_upc_raw and not get_upc_row_indexes(samples_df, scan_upc_norm):
             default_upc_raw = scan_upc_raw
 
-        # Initialize form state (persistent even after submit)
         st.session_state.setdefault("add_upc_raw", default_upc_raw)
         st.session_state.setdefault("add_brand", st.session_state.get("af_brand", ""))
         st.session_state.setdefault("add_product_name", st.session_state.get("af_product_name", ""))
@@ -747,14 +744,9 @@ with tab_add:
         st.session_state.setdefault("add_brand_contact_text", "")
         st.session_state.setdefault("add_notes", "")
 
-        # Build contact select labels
-        contact_label_map = {"(None)": "(None)"}
-        for _, r in contacts_df_sorted.iterrows():
-            contact_label_map[safe_str(r["contact_id"])] = contact_display_row(r)
-
         with st.form("add_item_form", clear_on_submit=False):
             r1, r2 = st.columns(2)
-            add_upc_raw = r1.text_input("UPC (scan here)", value=st.session_state["add_upc_raw"], placeholder="Scan barcode")
+            add_upc_raw = r1.text_input("UPC (scan here)", value=st.session_state["add_upc_raw"])
             st.session_state["add_upc_raw"] = add_upc_raw
             add_upc_norm = normalize_upc(add_upc_raw)
 
@@ -772,24 +764,26 @@ with tab_add:
             add_name = r4.text_input("Product name", value=st.session_state["add_product_name"])
             st.session_state["add_product_name"] = add_name
 
-            st.markdown("**Product details (dropdowns)**")
             d1, d2 = st.columns(2)
-            add_conc = d1.selectbox("Type / Concentration", options=CONCENTRATION_OPTIONS, index=CONCENTRATION_OPTIONS.index(st.session_state["add_concentration"]) if st.session_state["add_concentration"] in CONCENTRATION_OPTIONS else 0)
+            add_conc = d1.selectbox("Type / Concentration", options=CONCENTRATION_OPTIONS,
+                                   index=CONCENTRATION_OPTIONS.index(st.session_state["add_concentration"]) if st.session_state["add_concentration"] in CONCENTRATION_OPTIONS else 0)
             st.session_state["add_concentration"] = add_conc
-            add_conc_other = ""
+            conc_other = ""
             if add_conc == "Other":
-                add_conc_other = d1.text_input("If Other, specify", value=st.session_state["add_conc_other"])
-                st.session_state["add_conc_other"] = add_conc_other
+                conc_other = d1.text_input("If Other, specify", value=st.session_state["add_conc_other"])
+                st.session_state["add_conc_other"] = conc_other
 
-            add_size = d2.selectbox("Size", options=SIZE_OPTIONS, index=SIZE_OPTIONS.index(st.session_state["add_size"]) if st.session_state["add_size"] in SIZE_OPTIONS else 0)
+            add_size = d2.selectbox("Size", options=SIZE_OPTIONS,
+                                    index=SIZE_OPTIONS.index(st.session_state["add_size"]) if st.session_state["add_size"] in SIZE_OPTIONS else 0)
             st.session_state["add_size"] = add_size
-            add_size_other = ""
+            size_other = ""
             if add_size == "Other":
-                add_size_other = d2.text_input("If Other, specify", value=st.session_state["add_size_other"])
-                st.session_state["add_size_other"] = add_size_other
+                size_other = d2.text_input("If Other, specify", value=st.session_state["add_size_other"])
+                st.session_state["add_size_other"] = size_other
 
-            # Relationships / contacts
-            st.markdown("**Contacts (dropdowns)**")
+            variant_str = build_variant(add_conc, add_size, st.session_state.get("add_conc_other", ""), st.session_state.get("add_size_other", ""))
+
+            st.markdown("**Contacts**")
             c1, c2 = st.columns(2)
 
             source_contact_id = c1.selectbox(
@@ -823,10 +817,10 @@ with tab_add:
             st.session_state["add_brand_contact_text"] = brand_contact_text
 
             r7, r8 = st.columns(2)
-            add_batch = r7.text_input("Batch ID (optional)", value=st.session_state["add_batch_id"], placeholder="e.g., 2026-03-03-A")
+            add_batch = r7.text_input("Batch ID (optional)", value=st.session_state["add_batch_id"])
             st.session_state["add_batch_id"] = add_batch
 
-            add_notes = st.text_area("Notes (optional)", value=st.session_state["add_notes"], height=90, placeholder="Anything you want to remember…")
+            add_notes = st.text_area("Notes (optional)", value=st.session_state["add_notes"], height=90)
             st.session_state["add_notes"] = add_notes
 
             submitted = st.form_submit_button("Save to inventory", type="primary")
@@ -838,7 +832,6 @@ with tab_add:
             else:
                 hits = get_upc_row_indexes(samples_df, add_upc_norm)
 
-                # derive shipper display name
                 selected_source_name = ""
                 if source_contact_id != "(None)":
                     selected_source_name = contact_id_to_name.get(source_contact_id, "")
@@ -848,75 +841,15 @@ with tab_add:
                 else:
                     source_contact_id_final = source_contact_id
 
-                # build variant string from dropdowns
-                variant_str = build_variant(add_conc, add_size, st.session_state.get("add_conc_other", ""), st.session_state.get("add_size_other", ""))
-
                 if hits:
                     log_event(activity_log_path, "UPC_CONFLICT", add_upc_raw, add_upc_norm, f"UPC matched {len(hits)} existing row(s).")
                     st.error("That UPC already exists in your inventory.")
-
-                    with st.expander("Show matching record(s) and debug info", expanded=True):
-                        st.write({
-                            "Your scan (raw)": add_upc_raw,
-                            "Normalized UPC (digits only)": add_upc_norm,
-                            "Matches found": len(hits),
-                        })
-                        match_df = samples_df.iloc[hits][[
-                            "upc", "brand", "product_name", "variant", "received_date", "source_shipper", "contact_handle", "status", "last_updated"
-                        ]].copy()
-                        st.dataframe(match_df, use_container_width=True, hide_index=True)
-
-                    fix1, fix2 = st.columns([1.2, 1.8])
-                    with fix1:
-                        if st.button("Load existing into this form"):
-                            set_add_form_from_existing(samples_df.iloc[hits[0]])
-                            st.info("Loaded the existing record into the form.")
-                            st.rerun()
-
-                    with fix2:
-                        if st.button("Update existing with current form values", type="primary"):
-                            updates = {
-                                "brand": add_brand.strip(),
-                                "product_name": add_name.strip(),
-                                "concentration": add_conc,
-                                "size": add_size,
-                                "variant": variant_str,
-
-                                "source_contact_id": "" if source_contact_id_final == "(None)" else source_contact_id_final,
-                                "source_shipper": selected_source_name.strip(),
-                                "brand_contact_id": "" if brand_contact_id == "(None)" else brand_contact_id,
-                                "contact_handle": brand_contact_text.strip(),
-
-                                "batch_id": add_batch.strip(),
-                                "received_date": str(received),
-                                "notes": add_notes.strip(),
-
-                                "fragrance_url": st.session_state.get("af_fragrance_url", ""),
-                                "country": st.session_state.get("af_country", ""),
-                                "gender": st.session_state.get("af_gender", ""),
-                                "year": st.session_state.get("af_year", ""),
-                                "top_notes": st.session_state.get("af_top_notes", ""),
-                                "middle_notes": st.session_state.get("af_middle_notes", ""),
-                                "base_notes": st.session_state.get("af_base_notes", ""),
-                                "main_accord_1": st.session_state.get("af_main_accord_1", ""),
-                                "main_accord_2": st.session_state.get("af_main_accord_2", ""),
-                                "main_accord_3": st.session_state.get("af_main_accord_3", ""),
-                                "main_accord_4": st.session_state.get("af_main_accord_4", ""),
-                                "main_accord_5": st.session_state.get("af_main_accord_5", ""),
-                                "rating_value": st.session_state.get("af_rating_value", ""),
-                                "rating_count": st.session_state.get("af_rating_count", ""),
-                                "perfumer1": st.session_state.get("af_perfumer1", ""),
-                                "perfumer2": st.session_state.get("af_perfumer2", ""),
-                            }
-                            try:
-                                samples_df = update_existing_by_upc(
-                                    samples_df, samples_path, activity_log_path,
-                                    add_upc_raw, updates, track_amazon
-                                )
-                                st.success("Updated the existing UPC record (and kept your form data).")
-                            except Exception as e:
-                                st.error(str(e))
-
+                    with st.expander("Show matching record(s)", expanded=True):
+                        st.dataframe(
+                            samples_df.iloc[hits][["upc", "brand", "product_name", "variant", "received_date", "source_shipper", "status", "last_updated"]],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
                 else:
                     row = {k: "" for k in SAMPLES_FIELDS}
                     row["upc"] = add_upc_norm
@@ -939,22 +872,18 @@ with tab_add:
                     row["instagram_posted"] = "0"
                     row["amazon_posted"] = "0"
 
-                    # catalog autofill association
                     row["fragrance_url"] = st.session_state.get("af_fragrance_url", "")
                     row["country"] = st.session_state.get("af_country", "")
                     row["gender"] = st.session_state.get("af_gender", "")
                     row["year"] = st.session_state.get("af_year", "")
-
                     row["top_notes"] = st.session_state.get("af_top_notes", "")
                     row["middle_notes"] = st.session_state.get("af_middle_notes", "")
                     row["base_notes"] = st.session_state.get("af_base_notes", "")
-
                     row["main_accord_1"] = st.session_state.get("af_main_accord_1", "")
                     row["main_accord_2"] = st.session_state.get("af_main_accord_2", "")
                     row["main_accord_3"] = st.session_state.get("af_main_accord_3", "")
                     row["main_accord_4"] = st.session_state.get("af_main_accord_4", "")
                     row["main_accord_5"] = st.session_state.get("af_main_accord_5", "")
-
                     row["rating_value"] = st.session_state.get("af_rating_value", "")
                     row["rating_count"] = st.session_state.get("af_rating_count", "")
                     row["perfumer1"] = st.session_state.get("af_perfumer1", "")
@@ -967,9 +896,9 @@ with tab_add:
                     samples_df = pd.concat([samples_df, pd.DataFrame([row])], ignore_index=True)
                     save_samples(samples_df, samples_path)
                     log_event(activity_log_path, "ADD_SUCCESS", add_upc_raw, add_upc_norm, "Added new inventory row.")
-                    st.success("Saved. Your inventory CSV has been updated.")
+                    st.success("Saved.")
 
-                    # Clear only on success
+                    # Clear on success
                     st.session_state["add_upc_raw"] = ""
                     st.session_state["add_brand"] = st.session_state.get("af_brand", "")
                     st.session_state["add_product_name"] = st.session_state.get("af_product_name", "")
@@ -985,172 +914,192 @@ with tab_add:
                     st.session_state["add_notes"] = ""
                     st.rerun()
 
-        if st.button("Reset form (does not delete inventory)"):
-            st.session_state["add_upc_raw"] = ""
-            st.session_state["add_brand"] = st.session_state.get("af_brand", "")
-            st.session_state["add_product_name"] = st.session_state.get("af_product_name", "")
-            st.session_state["add_concentration"] = "Unknown"
-            st.session_state["add_conc_other"] = ""
-            st.session_state["add_size"] = "Unknown"
-            st.session_state["add_size_other"] = ""
-            st.session_state["add_batch_id"] = ""
-            st.session_state["add_source_contact_id"] = "(None)"
-            st.session_state["add_source_shipper_override"] = ""
-            st.session_state["add_brand_contact_id"] = "(None)"
-            st.session_state["add_brand_contact_text"] = ""
-            st.session_state["add_notes"] = ""
-            st.info("Form reset.")
-            st.rerun()
+
+# ----------------------------
+# Posting Updates (By UPC)
+# ----------------------------
+with tab_post:
+    st.subheader("Posting Updates")
+    st.caption("Scan/paste a UPC, then mark platforms as posted and add URLs. This saves immediately.")
+
+    pu1, pu2 = st.columns([2.2, 7.8])
+    with pu1:
+        pu_upc_raw = st.text_input("UPC to update", value=scan_upc_raw, placeholder="Scan barcode")
+        pu_upc_norm = normalize_upc(pu_upc_raw)
+
+    hits = get_upc_row_indexes(samples_df, pu_upc_norm) if pu_upc_norm else []
+    if not pu_upc_norm:
+        st.info("Scan/paste a UPC to begin.")
+    elif not hits:
+        st.error("UPC not found. Add it first in Add / Receive.")
+    else:
+        idx = hits[0]
+        row = samples_df.loc[idx].copy()
+
+        st.write(f"**{row.get('brand','')}** — {row.get('product_name','')}  \nUPC: `{row.get('upc','')}`  \nCurrent status: **{row.get('status','')}**")
+
+        with st.form("posting_update_form", clear_on_submit=False):
+            p1, p2, p3 = st.columns(3)
+
+            tt_posted = p1.checkbox("TikTok posted", value=(row.get("tiktok_posted","0") == "1"))
+            tt_url = p1.text_input("TikTok URL", value=row.get("tiktok_url",""))
+
+            ig_posted = p2.checkbox("Instagram posted", value=(row.get("instagram_posted","0") == "1"))
+            ig_url = p2.text_input("Instagram URL", value=row.get("instagram_url",""))
+
+            if track_amazon:
+                am_posted = p3.checkbox("Amazon posted", value=(row.get("amazon_posted","0") == "1"))
+                am_url = p3.text_input("Amazon URL", value=row.get("amazon_url",""))
+            else:
+                am_posted = True
+                am_url = row.get("amazon_url","")
+                p3.caption("Amazon tracking is turned off in the sidebar.")
+
+            save_posting = st.form_submit_button("Save posting updates", type="primary")
+
+        if save_posting:
+            updates = {
+                "tiktok_posted": "1" if tt_posted else "0",
+                "tiktok_url": tt_url.strip(),
+                "instagram_posted": "1" if ig_posted else "0",
+                "instagram_url": ig_url.strip(),
+            }
+            if track_amazon:
+                updates.update({
+                    "amazon_posted": "1" if am_posted else "0",
+                    "amazon_url": am_url.strip(),
+                })
+
+            try:
+                samples_df = update_item_by_upc(samples_df, samples_path, activity_log_path, pu_upc_raw, updates, track_amazon)
+                st.success("Posting updates saved.")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
 
 
 # ----------------------------
-# Content Queue
-# ----------------------------
-with tab_queue:
-    st.subheader("Content Queue")
-
-    def missing_platforms(row: pd.Series) -> str:
-        missing = []
-        if row.get("tiktok_posted", "0") != "1":
-            missing.append("TikTok")
-        if row.get("instagram_posted", "0") != "1":
-            missing.append("Instagram")
-        if track_amazon and row.get("amazon_posted", "0") != "1":
-            missing.append("Amazon")
-        return ", ".join(missing)
-
-    queue_df = samples_df[samples_df["status"] != STATUS_COMPLETE].copy()
-    queue_df["missing"] = queue_df.apply(missing_platforms, axis=1)
-
-    f1, f2, f3 = st.columns([2, 2, 6])
-    with f1:
-        status_filter = st.multiselect("Status", options=ALL_STATUSES, default=[STATUS_NEW, STATUS_FILMED, STATUS_POSTED])
-    with f2:
-        brand_contains = st.text_input("Brand contains", value="")
-    with f3:
-        st.caption("Quick Actions update your CSV immediately.")
-
-    if status_filter:
-        queue_df = queue_df[queue_df["status"].isin(status_filter)]
-    if brand_contains.strip():
-        queue_df = queue_df[queue_df["brand"].str.lower().str.contains(brand_contains.strip().lower(), na=False)]
-
-    st.dataframe(
-        queue_df[["upc", "brand", "product_name", "variant", "status", "missing", "received_date", "source_shipper", "contact_handle"]],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.divider()
-    st.subheader("Quick Actions")
-
-    qa_upc_raw = st.text_input("UPC for quick actions", value=scan_upc_raw, placeholder="Scan barcode")
-    qa_upc_norm = normalize_upc(qa_upc_raw)
-
-    def quick_update(updates: Dict[str, str], action_name: str):
-        try:
-            df_local = samples_df.copy()
-            hits = get_upc_row_indexes(df_local, qa_upc_norm)
-            if not qa_upc_norm:
-                raise ValueError("UPC is required.")
-            if not hits:
-                raise KeyError("UPC not found.")
-            idx = hits[0]
-            for k, v in updates.items():
-                if k in df_local.columns:
-                    df_local.at[idx, k] = v
-
-            for col in ["tiktok_posted", "instagram_posted", "amazon_posted"]:
-                df_local.at[idx, col] = normalize_bool01(df_local.at[idx, col])
-
-            df_local.at[idx, "status"] = compute_status(df_local.loc[idx], track_amazon)
-            df_local.at[idx, "last_updated"] = now_str()
-
-            save_samples(df_local, samples_path)
-            log_event(activity_log_path, action_name, qa_upc_raw, qa_upc_norm, "Quick action applied.")
-            st.success("Updated and saved.")
-            st.rerun()
-        except Exception as e:
-            log_event(activity_log_path, "QUICK_ACTION_FAIL", qa_upc_raw, qa_upc_norm, str(e))
-            st.error(str(e))
-
-    b1, b2, b3, b4, b5 = st.columns([1.2, 1.0, 1.4, 1.6, 3.0])
-    with b1:
-        if st.button("Mark FILMED", type="primary"):
-            quick_update({"status": STATUS_FILMED}, "MARK_FILMED")
-    with b2:
-        if st.button("Mark NEW"):
-            quick_update({"status": STATUS_NEW}, "MARK_NEW")
-    with b3:
-        if st.button("TikTok POSTED"):
-            quick_update({"tiktok_posted": "1"}, "TIKTOK_POSTED")
-    with b4:
-        if st.button("Instagram POSTED"):
-            quick_update({"instagram_posted": "1"}, "INSTAGRAM_POSTED")
-    with b5:
-        if track_amazon:
-            if st.button("Amazon POSTED"):
-                quick_update({"amazon_posted": "1"}, "AMAZON_POSTED")
-        else:
-            st.caption("Amazon tracking is turned off in the sidebar.")
-
-
-# ----------------------------
-# Inventory
+# Inventory Admin (Update + Delete)
 # ----------------------------
 with tab_inventory:
-    st.subheader("Inventory")
-    st.caption("Edit directly, then save. UPCs are normalized to digits-only. Controlled fields are still editable here if needed.")
+    st.subheader("Inventory Admin")
+    st.caption("Update an item by UPC, or delete items safely. Also includes a full table editor for advanced fixes.")
 
-    view_df = filtered_df.copy()
-    if scan_upc_norm and scan_hits:
-        view_df = samples_df.iloc[scan_hits].copy()
+    st.markdown("### Update item by UPC")
+    iu1, iu2 = st.columns([2.2, 7.8])
+    with iu1:
+        iu_upc_raw = st.text_input("UPC to edit", value=scan_upc_raw, placeholder="Scan barcode")
+        iu_upc_norm = normalize_upc(iu_upc_raw)
+
+    hits = get_upc_row_indexes(samples_df, iu_upc_norm) if iu_upc_norm else []
+    if iu_upc_norm and hits:
+        idx = hits[0]
+        row = samples_df.loc[idx].copy()
+
+        with st.form("inventory_update_form", clear_on_submit=False):
+            a1, a2 = st.columns(2)
+            brand = a1.text_input("Brand", value=row.get("brand",""))
+            name = a2.text_input("Product name", value=row.get("product_name",""))
+
+            b1, b2 = st.columns(2)
+            conc = b1.selectbox("Type / Concentration", options=CONCENTRATION_OPTIONS,
+                                index=CONCENTRATION_OPTIONS.index(row.get("concentration","Unknown")) if row.get("concentration","Unknown") in CONCENTRATION_OPTIONS else 0)
+            size = b2.selectbox("Size", options=SIZE_OPTIONS,
+                                index=SIZE_OPTIONS.index(row.get("size","Unknown")) if row.get("size","Unknown") in SIZE_OPTIONS else 0)
+
+            c1, c2 = st.columns(2)
+            status = c1.selectbox("Status", options=ALL_STATUSES, index=ALL_STATUSES.index(row.get("status", STATUS_NEW)) if row.get("status", STATUS_NEW) in ALL_STATUSES else 0)
+            received_date = c2.text_input("Received date (YYYY-MM-DD)", value=row.get("received_date",""))
+
+            notes = st.text_area("Notes", value=row.get("notes",""), height=90)
+
+            save_edit = st.form_submit_button("Save item changes", type="primary")
+
+        if save_edit:
+            updates = {
+                "brand": brand.strip(),
+                "product_name": name.strip(),
+                "concentration": conc,
+                "size": size,
+                "variant": build_variant(conc, size),
+                "status": status,
+                "received_date": received_date.strip(),
+                "notes": notes.strip(),
+            }
+            try:
+                samples_df = update_item_by_upc(samples_df, samples_path, activity_log_path, iu_upc_raw, updates, track_amazon)
+                st.success("Item updated.")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+    elif iu_upc_norm and not hits:
+        st.info("UPC not found. Add it in Add / Receive.")
+    else:
+        st.info("Scan/paste a UPC to edit an item.")
+
+    st.divider()
+    st.markdown("### Delete inventory items (safe)")
+    st.caption("Select UPCs to delete, then confirm. This is permanent in the CSV.")
+
+    del_upcs = st.multiselect(
+        "Select UPC(s) to delete",
+        options=sorted([u for u in samples_df["upc"].unique().tolist() if u]),
+        default=[],
+    )
+
+    if del_upcs:
+        preview = samples_df[samples_df["upc"].isin(del_upcs)][["upc", "brand", "product_name", "variant", "received_date", "status"]].copy()
+        st.dataframe(preview, use_container_width=True, hide_index=True)
+
+        confirm = st.checkbox("I understand this will permanently delete the selected UPC rows.")
+        if st.button("Delete selected", type="primary", disabled=not confirm):
+            before = len(samples_df)
+            samples_df = samples_df[~samples_df["upc"].isin(del_upcs)].copy()
+            after = len(samples_df)
+            save_samples(samples_df, samples_path)
+            log_event(activity_log_path, "DELETE_ITEMS", "", "", f"Deleted {before-after} row(s).")
+            st.success(f"Deleted {before-after} row(s).")
+            st.rerun()
+
+    st.divider()
+    st.markdown("### Full table editor (advanced)")
+    st.caption("Use this for rare fixes. Posting changes are easier in Posting Updates tab.")
 
     edited = st.data_editor(
-        view_df,
+        filtered_df,
         use_container_width=True,
         hide_index=True,
         num_rows="dynamic",
     )
 
-    c1, c2 = st.columns([1.2, 8.8])
-    with c1:
-        if st.button("Save changes", type="primary"):
-            updated = samples_df.copy()
+    if st.button("Save table edits", type="primary"):
+        updated = samples_df.copy()
 
-            edited_map = {}
-            for _, r in edited.iterrows():
-                u = normalize_upc(r.get("upc", ""))
-                if u:
-                    edited_map[u] = r
+        edited_map = {}
+        for _, r in edited.iterrows():
+            u = normalize_upc(r.get("upc", ""))
+            if u:
+                edited_map[u] = r
 
-            for i in range(len(updated)):
-                u = updated.at[i, "upc"]
-                if u in edited_map:
-                    for col in SAMPLES_FIELDS:
-                        val = edited_map[u].get(col, "")
-                        updated.at[i, col] = "" if pd.isna(val) else str(val)
+        for i in range(len(updated)):
+            u = updated.at[i, "upc"]
+            if u in edited_map:
+                for col in SAMPLES_FIELDS:
+                    val = edited_map[u].get(col, "")
+                    updated.at[i, col] = "" if pd.isna(val) else str(val)
 
-            updated["upc"] = updated["upc"].astype(str).apply(normalize_upc)
-            for i in range(len(updated)):
-                updated.at[i, "tiktok_posted"] = normalize_bool01(updated.at[i, "tiktok_posted"])
-                updated.at[i, "instagram_posted"] = normalize_bool01(updated.at[i, "instagram_posted"])
-                updated.at[i, "amazon_posted"] = normalize_bool01(updated.at[i, "amazon_posted"])
-                updated.at[i, "status"] = compute_status(updated.loc[i], track_amazon)
-                updated.at[i, "last_updated"] = now_str()
+        updated["upc"] = updated["upc"].astype(str).apply(normalize_upc)
+        for i in range(len(updated)):
+            updated.at[i, "tiktok_posted"] = normalize_bool01(updated.at[i, "tiktok_posted"])
+            updated.at[i, "instagram_posted"] = normalize_bool01(updated.at[i, "instagram_posted"])
+            updated.at[i, "amazon_posted"] = normalize_bool01(updated.at[i, "amazon_posted"])
+            updated.at[i, "status"] = compute_status(updated.loc[i], track_amazon)
+            updated.at[i, "last_updated"] = now_str()
 
-            save_samples(updated, samples_path)
-            log_event(activity_log_path, "INVENTORY_SAVE", "", "", "Saved edits from Inventory.")
-            st.success("Saved to CSV.")
-            st.rerun()
-
-    with c2:
-        st.download_button(
-            label="Download current samples.csv",
-            data=samples_df.to_csv(index=False).encode("utf-8"),
-            file_name=os.path.basename(samples_path),
-            mime="text/csv",
-        )
+        save_samples(updated, samples_path)
+        log_event(activity_log_path, "INVENTORY_TABLE_SAVE", "", "", "Saved edits from table editor.")
+        st.success("Saved.")
+        st.rerun()
 
 
 # ----------------------------
@@ -1158,19 +1107,20 @@ with tab_inventory:
 # ----------------------------
 with tab_contacts:
     st.subheader("Contacts")
-    st.caption("Create contacts once, then select them everywhere else. You can view all inventory tied to a contact here.")
+    st.caption("WhatsApp is supported. Create contacts once, then select them in Add/Receive.")
 
     st.markdown("### Add new contact")
     with st.form("add_contact_form", clear_on_submit=True):
         c1, c2, c3 = st.columns(3)
         name = c1.text_input("Name", placeholder="Maison Alhambra, VV Fragrances Wholesale, John Doe…")
         ctype = c2.selectbox("Contact type", options=CONTACT_TYPE_OPTIONS, index=0)
-        platform = c3.selectbox("Platform", options=["", "Instagram", "TikTok", "Email", "Phone", "Website", "Other"], index=0)
+        platform = c3.selectbox("Primary platform", options=["", "Instagram", "TikTok", "Email", "Phone", "Website", "Other"], index=0)
 
-        d1, d2, d3 = st.columns(3)
+        d1, d2, d3, d4 = st.columns(4)
         handle = d1.text_input("Handle (optional)", placeholder="@brandhandle")
         email = d2.text_input("Email (optional)")
         phone = d3.text_input("Phone (optional)")
+        whatsapp = d4.text_input("WhatsApp number (optional)", placeholder="+1 555 555 5555")
 
         notes = st.text_area("Notes (optional)", height=70)
         add_contact = st.form_submit_button("Add contact", type="primary")
@@ -1188,6 +1138,7 @@ with tab_contacts:
                 "handle": handle.strip(),
                 "email": email.strip(),
                 "phone": phone.strip(),
+                "whatsapp": whatsapp.strip(),
                 "notes": notes.strip(),
                 "last_updated": now_str(),
             }
@@ -1206,51 +1157,40 @@ with tab_contacts:
         num_rows="dynamic",
     )
 
-    save_c1, save_c2 = st.columns([1.2, 8.8])
-    with save_c1:
-        if st.button("Save contacts", type="primary"):
-            # Stamp last_updated on edited rows (best effort)
-            dfc = edited_contacts.copy()
-            if "last_updated" in dfc.columns:
-                dfc["last_updated"] = now_str()
-            save_contacts(dfc, contacts_path)
-            st.success("Contacts saved.")
-            st.rerun()
+    if st.button("Save contacts", type="primary"):
+        dfc = edited_contacts.copy()
+        if "last_updated" in dfc.columns:
+            dfc["last_updated"] = now_str()
+        save_contacts(dfc, contacts_path)
+        st.success("Contacts saved.")
+        st.rerun()
 
     st.divider()
     st.markdown("### Inventory by contact")
-
-    # Rebuild contact list after edits
-    contacts_df2 = load_contacts(contacts_path)
-    contacts_df2_sorted = contacts_df2.sort_values(by=["name", "contact_type"], ascending=[True, True]).copy()
-    contact_id_to_row = {safe_str(r["contact_id"]): r for _, r in contacts_df2_sorted.iterrows()}
-    contact_ids = contacts_df2_sorted["contact_id"].tolist()
-
-    if not contact_ids:
+    contacts_df2 = load_contacts(contacts_path).sort_values(by=["name", "contact_type"], ascending=[True, True]).copy()
+    if contacts_df2.empty:
         st.info("Add at least one contact to use this view.")
     else:
+        cid_to_row = {safe_str(r["contact_id"]): r for _, r in contacts_df2.iterrows()}
+        contact_ids = contacts_df2["contact_id"].tolist()
         selected_contact_id = st.selectbox(
             "Select a contact",
             options=contact_ids,
-            format_func=lambda cid: contact_display_row(contact_id_to_row[cid]),
+            format_func=lambda cid: contact_display_row(cid_to_row[cid]),
         )
-        selected_contact = contact_id_to_row[selected_contact_id]
-        selected_name = safe_str(selected_contact.get("name", "")).strip()
+        selected = cid_to_row[selected_contact_id]
+        selected_name = safe_str(selected.get("name", "")).strip()
 
-        # Match inventory rows:
-        # 1) by source_contact_id == selected_contact_id
-        # 2) OR by source_shipper name match (for older rows or overrides)
         inv = samples_df.copy()
         inv["source_contact_id"] = inv["source_contact_id"].fillna("")
         inv["source_shipper"] = inv["source_shipper"].fillna("")
+
         mask = (inv["source_contact_id"] == selected_contact_id) | (inv["source_shipper"].str.lower() == selected_name.lower())
         inv_hits = inv[mask].copy()
 
-        # If the contact is a Brand, also show items where brand matches
-        if safe_str(selected_contact.get("contact_type", "")) == "Brand" and selected_name:
+        if safe_str(selected.get("contact_type", "")) == "Brand" and selected_name:
             inv_hits = pd.concat([inv_hits, inv[inv["brand"].str.lower() == selected_name.lower()]], ignore_index=True).drop_duplicates()
 
-        st.write(f"**Inventory items linked to:** {selected_name}")
         if inv_hits.empty:
             st.info("No inventory items linked to this contact yet.")
         else:
@@ -1262,63 +1202,57 @@ with tab_contacts:
 
 
 # ----------------------------
-# Catalog Browser
+# Catalog
 # ----------------------------
 with tab_catalog:
-    st.subheader("Catalog Browser")
-    st.caption("Browse the dataset and confirm details. Use Add / Receive to apply autofill and save an item.")
+    st.subheader("Catalog")
+    st.caption("Base catalog is read-only (fra_cleaned.csv). Use overrides to add missing items or correct bad entries safely.")
 
-    if catalog_df is None:
-        st.warning("Catalog not loaded.")
-    else:
-        c1, c2, c3 = st.columns([2.5, 2.5, 5.0])
-        with c1:
-            bfilter = st.text_input("Brand filter", value="").strip().lower()
-        with c2:
-            pfilter = st.text_input("Perfume filter", value="").strip().lower()
-        with c3:
-            st.caption("Catalog is loaded from your dataset file, not from a live website connection.")
+    browse, admin = st.tabs(["Browse merged catalog", "Catalog overrides admin"])
 
-        cat_view = catalog_df.copy()
-        if bfilter:
-            cat_view = cat_view[cat_view["brand"].str.lower().str.contains(bfilter, na=False)]
-        if pfilter:
-            cat_view = cat_view[cat_view["perfume_display"].str.lower().str.contains(pfilter, na=False)]
+    with browse:
+        if catalog_df is None or catalog_df.empty:
+            st.warning("Merged catalog is empty. Add items in overrides admin.")
+        else:
+            f1, f2 = st.columns([2.5, 2.5])
+            bfilter = f1.text_input("Brand filter", value="").strip().lower()
+            pfilter = f2.text_input("Perfume filter", value="").strip().lower()
 
-        st.dataframe(
-            cat_view[[
-                "brand_display",
-                "perfume_display",
-                "year",
-                "gender",
-                "country",
-                "main_accord_1",
-                "main_accord_2",
-                "main_accord_3",
-                "main_accord_4",
-                "main_accord_5",
-                "rating_value",
-                "rating_count",
-                "perfumer1",
-                "perfumer2",
-                "url",
-            ]].rename(columns={
-                "brand_display": "Brand",
-                "perfume_display": "Perfume",
-                "main_accord_1": "Accord 1",
-                "main_accord_2": "Accord 2",
-                "main_accord_3": "Accord 3",
-                "main_accord_4": "Accord 4",
-                "main_accord_5": "Accord 5",
-                "rating_value": "Rating",
-                "rating_count": "Ratings",
-                "perfumer1": "Perfumer 1",
-                "perfumer2": "Perfumer 2",
-                "url": "URL",
-            }),
-            use_container_width=True,
-            hide_index=True,
-        )
+            view = catalog_df.copy()
+            if bfilter:
+                view = view[view["brand"].str.lower().str.contains(bfilter, na=False)]
+            if pfilter:
+                view = view[view["perfume"].str.lower().str.contains(pfilter, na=False)]
+
+            show_cols = ["brand", "perfume", "year", "gender", "country", "main_accord_1", "main_accord_2", "main_accord_3", "rating_value", "rating_count", "url"]
+            st.dataframe(view[show_cols], use_container_width=True, hide_index=True)
+
+    with admin:
+        st.markdown("### Edit catalog overrides (adds/repairs entries)")
+        st.caption("This writes to catalog_overrides.csv. Overrides win when merged with the base catalog.")
+
+        ov = load_catalog_overrides(catalog_overrides_path)
+        edited_ov = st.data_editor(ov, use_container_width=True, hide_index=True, num_rows="dynamic")
+
+        col1, col2 = st.columns([1.2, 8.8])
+        with col1:
+            if st.button("Save overrides", type="primary"):
+                try:
+                    save_catalog_overrides(edited_ov, catalog_overrides_path)
+                    log_event(activity_log_path, "SAVE_CATALOG_OVERRIDES", "", "", "Saved catalog overrides.")
+                    st.success("Overrides saved.")
+                    st.cache_data.clear()
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+
+        with col2:
+            st.download_button(
+                label="Download catalog_overrides.csv",
+                data=ov.to_csv(index=False).encode("utf-8"),
+                file_name=os.path.basename(catalog_overrides_path),
+                mime="text/csv",
+            )
 
 
 # ----------------------------
@@ -1326,8 +1260,6 @@ with tab_catalog:
 # ----------------------------
 with tab_log:
     st.subheader("Activity Log")
-    st.caption("Simple log of actions and conflicts. Attempts to write to activity_log.csv.")
-
     log_rows = st.session_state.get("activity_log", [])
     if not log_rows:
         st.write("No activity logged yet.")
@@ -1343,6 +1275,6 @@ with tab_log:
     )
 
 st.caption(
-    "Note: On Streamlit Community Cloud, file writes may not persist after restarts. "
-    "If you want permanent cloud persistence, the next upgrade is saving samples.csv and contacts.csv back to GitHub on each save."
+    "Note: On Streamlit Community Cloud, file writes can be ephemeral after restarts. "
+    "If you want true persistence, the next step is saving CSV changes back to GitHub automatically."
 )
