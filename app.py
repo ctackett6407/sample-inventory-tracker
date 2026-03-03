@@ -75,7 +75,6 @@ def now_str() -> str:
 
 
 def pretty_slug(s: str) -> str:
-    # Dataset often uses hyphenated slugs; make it human-friendly.
     return str(s).replace("-", " ").strip().title()
 
 
@@ -94,19 +93,14 @@ def load_samples(path: str) -> pd.DataFrame:
     ensure_samples_csv(path)
     df = pd.read_csv(path, dtype=str).fillna("")
 
-    # Ensure all columns exist
     for c in SAMPLES_FIELDS:
         if c not in df.columns:
             df[c] = ""
 
-    # Normalize boolean fields
     for col in ["tiktok_posted", "instagram_posted", "amazon_posted"]:
         df[col] = df[col].apply(normalize_bool01)
 
-    # Clean UPC whitespace
     df["upc"] = df["upc"].astype(str).str.strip()
-
-    # Keep consistent column order
     df = df[SAMPLES_FIELDS].copy()
     return df
 
@@ -140,10 +134,6 @@ def compute_status(row: pd.Series, track_amazon: bool) -> str:
 
 @st.cache_data
 def load_catalog(path: str) -> Optional[pd.DataFrame]:
-    """
-    Loads the cleaned Fragrantica-derived dataset (semicolon-delimited).
-    We normalize column names to a predictable internal schema.
-    """
     if not os.path.exists(path):
         return None
 
@@ -155,17 +145,7 @@ def load_catalog(path: str) -> Optional[pd.DataFrame]:
         dtype=str,
     ).fillna("")
 
-    # Normalize column names (case-insensitive and space-tolerant)
-    cols = {c: c.strip() for c in df.columns}
-    df.rename(columns=cols, inplace=True)
-
-    # Build a mapping from known dataset columns to internal standardized columns
-    # Dataset columns as described by you:
-    # URL, Perfume, Brand, Country, Gender, Rating Value, Rating Count, Year,
-    # Top Notes, Middle Notes, Base Notes, Perfumer1, Perfumer2, Main Accord 1-5
-    # Some cleaned files use: Top, Middle, Base, mainaccord1..5, url
-    colmap = {}
-
+    # Find columns safely (handles slight differences in cleaned file)
     def find_col(*candidates):
         existing = {c.lower(): c for c in df.columns}
         for cand in candidates:
@@ -174,37 +154,52 @@ def load_catalog(path: str) -> Optional[pd.DataFrame]:
                 return existing[key]
         return None
 
-    colmap["url"] = find_col("URL", "url")
-    colmap["perfume"] = find_col("Perfume", "perfume")
-    colmap["brand"] = find_col("Brand", "brand")
-    colmap["country"] = find_col("Country", "country")
-    colmap["gender"] = find_col("Gender", "gender")
-    colmap["rating_value"] = find_col("Rating Value", "rating value", "rating_value")
-    colmap["rating_count"] = find_col("Rating Count", "rating count", "rating_count")
-    colmap["year"] = find_col("Year", "year")
+    col_url = find_col("URL", "url")
+    col_perfume = find_col("Perfume", "perfume")
+    col_brand = find_col("Brand", "brand")
+    col_country = find_col("Country", "country")
+    col_gender = find_col("Gender", "gender")
+    col_rating_value = find_col("Rating Value", "rating value", "rating_value")
+    col_rating_count = find_col("Rating Count", "rating count", "rating_count")
+    col_year = find_col("Year", "year")
 
-    # Notes
-    colmap["top_notes"] = find_col("Top Notes", "Top", "top")
-    colmap["middle_notes"] = find_col("Middle Notes", "Middle", "middle")
-    colmap["base_notes"] = find_col("Base Notes", "Base", "base")
+    col_top = find_col("Top Notes", "Top", "top")
+    col_middle = find_col("Middle Notes", "Middle", "middle")
+    col_base = find_col("Base Notes", "Base", "base")
 
-    # Perfumers
-    colmap["perfumer1"] = find_col("Perfumer1", "perfumer1", "Perfumer 1")
-    colmap["perfumer2"] = find_col("Perfumer2", "perfumer2", "Perfumer 2")
+    col_perfumer1 = find_col("Perfumer1", "perfumer1", "Perfumer 1")
+    col_perfumer2 = find_col("Perfumer2", "perfumer2", "Perfumer 2")
 
-    # Accords
-    colmap["main_accord_1"] = find_col("Main Accord 1", "mainaccord1", "main_accord_1")
-    colmap["main_accord_2"] = find_col("Main Accord 2", "mainaccord2", "main_accord_2")
-    colmap["main_accord_3"] = find_col("Main Accord 3", "mainaccord3", "main_accord_3")
-    colmap["main_accord_4"] = find_col("Main Accord 4", "mainaccord4", "main_accord_4")
-    colmap["main_accord_5"] = find_col("Main Accord 5", "mainaccord5", "main_accord_5")
+    col_a1 = find_col("Main Accord 1", "mainaccord1", "main_accord_1")
+    col_a2 = find_col("Main Accord 2", "mainaccord2", "main_accord_2")
+    col_a3 = find_col("Main Accord 3", "mainaccord3", "main_accord_3")
+    col_a4 = find_col("Main Accord 4", "mainaccord4", "main_accord_4")
+    col_a5 = find_col("Main Accord 5", "mainaccord5", "main_accord_5")
 
-    # Create standardized columns in a clean catalog dataframe
     out = pd.DataFrame()
-    for k, src in colmap.items():
-        out[k] = df[src] if src else ""
+    out["url"] = df[col_url] if col_url else ""
+    out["perfume"] = df[col_perfume] if col_perfume else ""
+    out["brand"] = df[col_brand] if col_brand else ""
+    out["country"] = df[col_country] if col_country else ""
+    out["gender"] = df[col_gender] if col_gender else ""
+    out["rating_value"] = df[col_rating_value] if col_rating_value else ""
+    out["rating_count"] = df[col_rating_count] if col_rating_count else ""
+    out["year"] = df[col_year] if col_year else ""
 
-    # Clean key text columns
+    out["top_notes"] = df[col_top] if col_top else ""
+    out["middle_notes"] = df[col_middle] if col_middle else ""
+    out["base_notes"] = df[col_base] if col_base else ""
+
+    out["perfumer1"] = df[col_perfumer1] if col_perfumer1 else ""
+    out["perfumer2"] = df[col_perfumer2] if col_perfumer2 else ""
+
+    out["main_accord_1"] = df[col_a1] if col_a1 else ""
+    out["main_accord_2"] = df[col_a2] if col_a2 else ""
+    out["main_accord_3"] = df[col_a3] if col_a3 else ""
+    out["main_accord_4"] = df[col_a4] if col_a4 else ""
+    out["main_accord_5"] = df[col_a5] if col_a5 else ""
+
+    # Clean
     out["brand"] = out["brand"].astype(str).str.strip()
     out["perfume"] = out["perfume"].astype(str).str.strip()
     out["url"] = out["url"].astype(str).str.strip()
@@ -212,13 +207,10 @@ def load_catalog(path: str) -> Optional[pd.DataFrame]:
     # Normalize rating decimals like "4,21" -> "4.21"
     out["rating_value"] = out["rating_value"].astype(str).str.replace(",", ".", regex=False).str.strip()
 
-    # Add display-friendly names
     out["brand_display"] = out["brand"].apply(pretty_slug)
     out["perfume_display"] = out["perfume"].apply(pretty_slug)
 
-    # Drop rows without a brand or perfume
     out = out[(out["brand"].str.len() > 0) & (out["perfume"].str.len() > 0)].copy()
-
     return out
 
 
@@ -231,11 +223,9 @@ def get_upc_row_index(df: pd.DataFrame, upc: str) -> Optional[int]:
 
 
 def apply_catalog_to_session(crow: Dict[str, str]) -> None:
-    """
-    Stores catalog-selected fields in session_state so the Add form can autofill.
-    """
     st.session_state["af_brand"] = pretty_slug(crow.get("brand", ""))
     st.session_state["af_product_name"] = crow.get("perfume_display", "")
+
     st.session_state["af_fragrance_url"] = crow.get("url", "")
     st.session_state["af_country"] = crow.get("country", "")
     st.session_state["af_gender"] = crow.get("gender", "")
@@ -259,19 +249,44 @@ def apply_catalog_to_session(crow: Dict[str, str]) -> None:
 
 
 def clear_autofill() -> None:
-    keys = [k for k in st.session_state.keys() if k.startswith("af_")]
+    keys = [k for k in list(st.session_state.keys()) if k.startswith("af_")]
     for k in keys:
         del st.session_state[k]
+
+
+def update_samples_by_upc(
+    df: pd.DataFrame,
+    samples_path: str,
+    upc: str,
+    updates: Dict[str, str],
+    track_amazon: bool
+) -> pd.DataFrame:
+    upc = (upc or "").strip()
+    if not upc:
+        raise ValueError("UPC is required.")
+    idx = get_upc_row_index(df, upc)
+    if idx is None:
+        raise KeyError("UPC not found.")
+
+    for k, v in updates.items():
+        if k in df.columns:
+            df.at[idx, k] = v
+
+    df.at[idx, "tiktok_posted"] = normalize_bool01(df.at[idx, "tiktok_posted"])
+    df.at[idx, "instagram_posted"] = normalize_bool01(df.at[idx, "instagram_posted"])
+    df.at[idx, "amazon_posted"] = normalize_bool01(df.at[idx, "amazon_posted"])
+
+    df.at[idx, "status"] = compute_status(df.loc[idx], track_amazon)
+    df.at[idx, "last_updated"] = now_str()
+
+    save_samples(df, samples_path)
+    return df
 
 
 # ----------------------------
 # UI
 # ----------------------------
-st.set_page_config(
-    page_title="Sample Inventory + Content Tracker",
-    layout="wide",
-)
-
+st.set_page_config(page_title="Sample Inventory + Content Tracker", layout="wide")
 st.title("Sample Inventory + Content Tracker")
 
 with st.sidebar:
@@ -284,15 +299,15 @@ with st.sidebar:
 
     st.subheader("Catalog (Brand → Perfume Autofill)")
     catalog_path = st.text_input("Catalog CSV path", value=DEFAULT_CATALOG_CSV)
-    st.caption("Uses the cleaned dataset file you added to your repo.")
+    st.caption("Uses the cleaned dataset file stored in your repo.")
 
 samples_df = load_samples(samples_path)
 catalog_df = load_catalog(catalog_path)
 
-# Top quick access: scan/search
+# Top: scan/search
 st.subheader("Quick Scan / Search")
-
 q1, q2, q3 = st.columns([2.2, 2.2, 5.6])
+
 with q1:
     scan_upc = st.text_input(
         "Scan or paste UPC",
@@ -310,11 +325,11 @@ with q2:
 
 with q3:
     st.caption(
-        "Tip: If a scanned UPC is new, go to **Add / Receive** and it will prefill the UPC. "
-        "If it already exists, the Inventory tab will show it immediately."
+        "If a scanned UPC is new, go to **Add / Receive** and it will prefill the UPC. "
+        "If it already exists, edit it in **Inventory** or update it in **Content Queue**."
     )
 
-# Build a filtered view
+# Filter inventory for viewing
 filtered_df = samples_df.copy()
 if search_text:
     q = search_text.lower()
@@ -335,8 +350,6 @@ if scan_upc and selected_index is None:
 elif scan_upc and selected_index is not None:
     st.success("UPC found. You can edit it in **Inventory** or update status in **Content Queue**.")
 
-
-# Tabs for customer-friendly layout
 tab_dash, tab_add, tab_queue, tab_inventory, tab_catalog = st.tabs(
     ["Dashboard", "Add / Receive", "Content Queue", "Inventory", "Catalog Browser"]
 )
@@ -370,11 +383,12 @@ with tab_dash:
 
     st.divider()
 
-    st.subheader("What should you work on next?")
+    st.subheader("Recommended next actions")
     focus = samples_df[samples_df.apply(needs_posting, axis=1)].copy()
     focus = focus.sort_values(by=["received_date", "brand", "product_name"], ascending=[False, True, True])
+
     if len(focus) == 0:
-        st.write("No items are currently waiting on posting. Nice.")
+        st.write("No items are waiting on posting.")
     else:
         st.dataframe(
             focus[["upc", "brand", "product_name", "variant", "status", "tiktok_posted", "instagram_posted", "amazon_posted", "received_date"]],
@@ -382,9 +396,8 @@ with tab_dash:
             hide_index=True,
         )
 
-
 # ----------------------------
-# Add / Receive (catalog autofill + UPC association)
+# Add / Receive
 # ----------------------------
 with tab_add:
     st.subheader("Receive a new sample and associate it to a fragrance")
@@ -397,7 +410,11 @@ with tab_add:
         if catalog_df is None:
             st.warning("Catalog not loaded. Confirm the file exists at: data/fra_cleaned.csv")
         else:
-            brand_filter = st.text_input("Brand filter (optional)", value="", placeholder="Type to narrow brands…").strip().lower()
+            brand_filter = st.text_input(
+                "Brand filter (optional)",
+                value="",
+                placeholder="Type to narrow brands…"
+            ).strip().lower()
 
             brands = sorted(catalog_df["brand"].unique().tolist())
             if brand_filter:
@@ -407,7 +424,12 @@ with tab_add:
 
             brand_df = catalog_df[catalog_df["brand"] == selected_brand].copy()
 
-            perfume_filter = st.text_input("Perfume filter (optional)", value="", placeholder="Type to narrow perfumes…").strip().lower()
+            perfume_filter = st.text_input(
+                "Perfume filter (optional)",
+                value="",
+                placeholder="Type to narrow perfumes…"
+            ).strip().lower()
+
             perfumes = brand_df["perfume_display"].tolist()
             if perfume_filter:
                 perfumes = [p for p in perfumes if perfume_filter in p.lower()]
@@ -426,7 +448,7 @@ with tab_add:
                     clear_autofill()
                     st.info("Autofill cleared.")
 
-            with st.expander("Preview autofill details", expanded=False):
+            with st.expander("Preview details", expanded=False):
                 st.write({
                     "Brand": pretty_slug(picked_row.get("brand", "")),
                     "Perfume": picked_row.get("perfume_display", ""),
@@ -450,7 +472,6 @@ with tab_add:
         st.markdown("### 2) Scan UPC and save it to your inventory")
         st.caption("This writes a new row into samples.csv and ties the UPC to the selected fragrance details.")
 
-        # Prefill UPC if user scanned something at the top and it wasn't found
         upc_prefill = ""
         if scan_upc and get_upc_row_index(samples_df, scan_upc) is None:
             upc_prefill = scan_upc
@@ -488,25 +509,22 @@ with tab_add:
                 else:
                     row = {k: "" for k in SAMPLES_FIELDS}
 
-                    # basics
                     row["upc"] = new_upc
                     row["brand"] = new_brand.strip()
                     row["product_name"] = new_name.strip()
                     row["variant"] = new_variant.strip()
 
-                    # relationship/shipping
                     row["source_shipper"] = new_shipper.strip()
                     row["contact_handle"] = new_handle.strip()
                     row["received_date"] = str(received)
                     row["batch_id"] = new_batch.strip()
 
-                    # workflow defaults
                     row["status"] = STATUS_NEW
                     row["tiktok_posted"] = "0"
                     row["instagram_posted"] = "0"
                     row["amazon_posted"] = "0"
 
-                    # catalog autofill (if available)
+                    # catalog autofill
                     row["fragrance_url"] = st.session_state.get("af_fragrance_url", "")
                     row["country"] = st.session_state.get("af_country", "")
                     row["gender"] = st.session_state.get("af_gender", "")
@@ -528,20 +546,17 @@ with tab_add:
                     row["perfumer1"] = st.session_state.get("af_perfumer1", "")
                     row["perfumer2"] = st.session_state.get("af_perfumer2", "")
 
-                    # misc
                     row["notes"] = new_notes.strip()
                     row["last_updated"] = now_str()
 
-                    # compute status
                     row["status"] = compute_status(pd.Series(row), track_amazon)
 
                     samples_df = pd.concat([samples_df, pd.DataFrame([row])], ignore_index=True)
                     save_samples(samples_df, samples_path)
                     st.success("Saved. Your inventory CSV has been updated.")
 
-
 # ----------------------------
-# Content Queue (best-practice: work list + quick actions)
+# Content Queue
 # ----------------------------
 with tab_queue:
     st.subheader("Content Queue")
@@ -565,7 +580,7 @@ with tab_queue:
     with f2:
         brand_contains = st.text_input("Brand contains", value="")
     with f3:
-        st.caption("Use the quick actions below to update filming and posting without digging through the table.")
+        st.caption("Use Quick Actions below to update filming and posting without digging through the table.")
 
     if status_filter:
         queue_df = queue_df[queue_df["status"].isin(status_filter)]
@@ -582,53 +597,45 @@ with tab_queue:
     st.subheader("Quick Actions")
     st.caption("Scan/paste a UPC, then click actions. This updates the CSV immediately.")
 
-    qa1, qa2 = st.columns([2, 8])
-    with qa1:
-        qa_upc = st.text_input("UPC for quick actions", value=scan_upc.strip(), placeholder="Scan barcode").strip()
+    qa_upc = st.text_input("UPC for quick actions", value=scan_upc.strip(), placeholder="Scan barcode").strip()
 
-    def update_by_upc(upc: str, updates: Dict[str, str]) -> None:
-        nonlocal samples_df
-        idx = get_upc_row_index(samples_df, upc)
-        if idx is None:
-            st.error("UPC not found in inventory.")
-            return
+    b1, b2, b3, b4, b5 = st.columns([1.2, 1.0, 1.4, 1.6, 3.0])
 
-        for k, v in updates.items():
-            samples_df.at[idx, k] = v
+    try:
+        with b1:
+            if st.button("Mark FILMED", type="primary"):
+                samples_df = update_samples_by_upc(samples_df, samples_path, qa_upc, {"status": STATUS_FILMED}, track_amazon)
+                st.rerun()
 
-        samples_df.at[idx, "status"] = compute_status(samples_df.loc[idx], track_amazon)
-        samples_df.at[idx, "last_updated"] = now_str()
-        save_samples(samples_df, samples_path)
-        st.success("Updated and saved to CSV.")
+        with b2:
+            if st.button("Mark NEW"):
+                samples_df = update_samples_by_upc(samples_df, samples_path, qa_upc, {"status": STATUS_NEW}, track_amazon)
+                st.rerun()
 
-    b1, b2, b3, b4, b5 = st.columns([1.2, 1.2, 1.4, 1.4, 3.0])
+        with b3:
+            if st.button("TikTok POSTED"):
+                samples_df = update_samples_by_upc(samples_df, samples_path, qa_upc, {"tiktok_posted": "1"}, track_amazon)
+                st.rerun()
 
-    with b1:
-        if st.button("Mark FILMED", type="primary"):
-            update_by_upc(qa_upc, {"status": STATUS_FILMED})
+        with b4:
+            if st.button("Instagram POSTED"):
+                samples_df = update_samples_by_upc(samples_df, samples_path, qa_upc, {"instagram_posted": "1"}, track_amazon)
+                st.rerun()
 
-    with b2:
-        if st.button("Mark NEW"):
-            update_by_upc(qa_upc, {"status": STATUS_NEW})
-
-    with b3:
-        if st.button("TikTok POSTED"):
-            update_by_upc(qa_upc, {"tiktok_posted": "1"})
-
-    with b4:
-        if st.button("Instagram POSTED"):
-            update_by_upc(qa_upc, {"instagram_posted": "1"})
-
-    with b5:
-        if track_amazon:
-            if st.button("Amazon POSTED"):
-                update_by_upc(qa_upc, {"amazon_posted": "1"})
-        else:
-            st.caption("Amazon tracking is turned off in the sidebar.")
+        with b5:
+            if track_amazon:
+                if st.button("Amazon POSTED"):
+                    samples_df = update_samples_by_upc(samples_df, samples_path, qa_upc, {"amazon_posted": "1"}, track_amazon)
+                    st.rerun()
+            else:
+                st.caption("Amazon tracking is turned off in the sidebar.")
+    except (ValueError, KeyError) as e:
+        st.error(str(e))
 
     st.divider()
     st.subheader("Add links (optional)")
     st.caption("Paste URLs after posting so you can reference them later.")
+
     link_upc = st.text_input("UPC to add links", value=qa_upc).strip()
     l1, l2, l3 = st.columns(3)
     with l1:
@@ -639,10 +646,7 @@ with tab_queue:
         amz_url = st.text_input("Amazon URL", value="") if track_amazon else ""
 
     if st.button("Save links"):
-        idx = get_upc_row_index(samples_df, link_upc)
-        if idx is None:
-            st.error("UPC not found.")
-        else:
+        try:
             updates = {}
             if tt_url.strip():
                 updates["tiktok_url"] = tt_url.strip()
@@ -650,22 +654,24 @@ with tab_queue:
                 updates["instagram_url"] = ig_url.strip()
             if track_amazon and amz_url.strip():
                 updates["amazon_url"] = amz_url.strip()
-            if updates:
-                update_by_upc(link_upc, updates)
-            else:
-                st.info("Nothing to save.")
 
+            if not updates:
+                st.info("Nothing to save.")
+            else:
+                samples_df = update_samples_by_upc(samples_df, samples_path, link_upc, updates, track_amazon)
+                st.success("Links saved.")
+                st.rerun()
+        except (ValueError, KeyError) as e:
+            st.error(str(e))
 
 # ----------------------------
-# Inventory (edit in place)
+# Inventory
 # ----------------------------
 with tab_inventory:
     st.subheader("Inventory")
     st.caption("Edit directly, then save. Use search/scan at the top to narrow what you see.")
 
     view_df = filtered_df.copy()
-
-    # If a UPC was scanned and exists, show only that row for focused editing
     if scan_upc and selected_index is not None:
         view_df = samples_df.iloc[[selected_index]].copy()
 
@@ -679,18 +685,16 @@ with tab_inventory:
     c1, c2 = st.columns([1.2, 8.8])
     with c1:
         if st.button("Save changes", type="primary"):
-            # Merge edits back by UPC
             updated = samples_df.copy()
-            edited_map = {r["upc"]: r for _, r in edited.iterrows() if str(r.get("upc", "")).strip()}
+            edited_map = {str(r["upc"]).strip(): r for _, r in edited.iterrows() if str(r.get("upc", "")).strip()}
 
             for i in range(len(updated)):
-                u = updated.at[i, "upc"]
+                u = str(updated.at[i, "upc"]).strip()
                 if u in edited_map:
                     for col in SAMPLES_FIELDS:
                         val = edited_map[u].get(col, "")
                         updated.at[i, col] = "" if pd.isna(val) else str(val)
 
-            # Normalize + recompute status
             for i in range(len(updated)):
                 updated.at[i, "tiktok_posted"] = normalize_bool01(updated.at[i, "tiktok_posted"])
                 updated.at[i, "instagram_posted"] = normalize_bool01(updated.at[i, "instagram_posted"])
@@ -701,6 +705,7 @@ with tab_inventory:
             samples_df = updated
             save_samples(samples_df, samples_path)
             st.success("Saved to CSV.")
+            st.rerun()
 
     with c2:
         st.download_button(
@@ -710,13 +715,12 @@ with tab_inventory:
             mime="text/csv",
         )
 
-
 # ----------------------------
-# Catalog Browser (optional but helpful for discovery)
+# Catalog Browser
 # ----------------------------
 with tab_catalog:
     st.subheader("Catalog Browser")
-    st.caption("Browse the catalog and copy details, or use the Add / Receive tab to apply autofill directly.")
+    st.caption("Browse the catalog and confirm details. Use Add / Receive to apply autofill and save an item.")
 
     if catalog_df is None:
         st.warning("Catalog not loaded.")
@@ -771,6 +775,6 @@ with tab_catalog:
         )
 
 st.caption(
-    "Note: Your app is deployed on Streamlit Community Cloud. If you want your CSV changes to persist permanently in the cloud, "
-    "the best practice is to save the updated CSV back to GitHub on each save. Tell me and I’ll implement that next."
+    "Note: Streamlit Community Cloud may not permanently persist file writes after restarts. "
+    "If you want your CSV changes to be permanent in the cloud, the best practice is to save the updated CSV back to GitHub."
 )
