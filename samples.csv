@@ -1,0 +1,3 @@
+upc,brand,product_name,variant,source_shipper,contact_handle,received_date,batch_id,status,tiktok_posted,tiktok_url,instagram_posted,instagram_url,amazon_posted,amazon_url,notes,last_updated
+012345678905,Example Brand,Example Sample Fragrance,EDP 10ml,VV Fragrances Wholesale,@examplebrand,3/3/2026,2026-03-03-A,NEW,0,,0,,0,,Replace this row with your real sample data.,3/3/2026 16:54
+098765432109,Another Brand,Example Product 2,Extrait 2ml,Brand PR,,3/3/2026,,FILMED,0,,0,,0,,"Filmed, not posted yet.",3/3/2026 16:54
