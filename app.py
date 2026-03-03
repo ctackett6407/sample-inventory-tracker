@@ -5,6 +5,7 @@
 # - Add/Receive does NOT lose entered data on validation errors
 # - When UPC "already exists", show matching rows + tools to fix
 # - Activity log (UI + activity_log.csv best-effort)
+# - Guardrails when Brand/Perfume filters return zero results (prevents IndexError)
 
 import os
 import re
@@ -73,7 +74,6 @@ SAMPLES_FIELDS = [
     "last_updated",
 ]
 
-
 LOG_FIELDS = ["timestamp", "action", "upc_raw", "upc_normalized", "message"]
 
 
@@ -97,7 +97,7 @@ def normalize_upc(upc_raw: str) -> str:
     """
     Normalize UPC scans to avoid false mismatches:
     - strip whitespace
-    - keep digits only (scanners sometimes add CR/LF or other characters)
+    - keep digits only
     """
     s = "" if upc_raw is None else str(upc_raw)
     s = s.strip()
@@ -107,8 +107,7 @@ def normalize_upc(upc_raw: str) -> str:
 
 def ensure_samples_csv(path: str) -> None:
     if not os.path.exists(path):
-        df = pd.DataFrame(columns=SAMPLES_FIELDS)
-        df.to_csv(path, index=False)
+        pd.DataFrame(columns=SAMPLES_FIELDS).to_csv(path, index=False)
 
 
 def ensure_activity_log(path: str) -> None:
@@ -120,7 +119,7 @@ def log_event(activity_log_path: str, action: str, upc_raw: str, upc_norm: str, 
     """
     Best-effort logging to:
     - session_state for immediate UI
-    - activity_log.csv on disk (persists locally; cloud persistence depends on hosting)
+    - activity_log.csv on disk
     """
     event = {
         "timestamp": now_str(),
@@ -138,7 +137,6 @@ def log_event(activity_log_path: str, action: str, upc_raw: str, upc_norm: str, 
         df = pd.concat([df, pd.DataFrame([event])], ignore_index=True)
         df.to_csv(activity_log_path, index=False)
     except Exception:
-        # Do not break UX if file write fails on cloud
         pass
 
 
@@ -153,9 +151,7 @@ def load_samples(path: str) -> pd.DataFrame:
     for col in ["tiktok_posted", "instagram_posted", "amazon_posted"]:
         df[col] = df[col].apply(normalize_bool01)
 
-    # Normalize stored UPCs for consistency
     df["upc"] = df["upc"].astype(str).apply(normalize_upc)
-
     df = df[SAMPLES_FIELDS].copy()
     return df
 
@@ -165,10 +161,7 @@ def save_samples(df: pd.DataFrame, path: str) -> None:
         if c not in df.columns:
             df[c] = ""
     df = df[SAMPLES_FIELDS].copy()
-
-    # Normalize UPCs at write-time as well
     df["upc"] = df["upc"].astype(str).apply(normalize_upc)
-
     df.to_csv(path, index=False)
 
 
@@ -260,7 +253,6 @@ def load_catalog(path: str) -> Optional[pd.DataFrame]:
     out["brand"] = out["brand"].astype(str).str.strip()
     out["perfume"] = out["perfume"].astype(str).str.strip()
     out["url"] = out["url"].astype(str).str.strip()
-
     out["rating_value"] = out["rating_value"].astype(str).str.replace(",", ".", regex=False).str.strip()
 
     out["brand_display"] = out["brand"].apply(pretty_slug)
@@ -273,8 +265,7 @@ def load_catalog(path: str) -> Optional[pd.DataFrame]:
 def get_upc_row_indexes(df: pd.DataFrame, upc_norm: str) -> List[int]:
     if not upc_norm:
         return []
-    hits = df.index[df["upc"] == upc_norm].tolist()
-    return hits
+    return df.index[df["upc"] == upc_norm].tolist()
 
 
 def apply_catalog_to_session(crow: Dict[str, str]) -> None:
@@ -310,10 +301,6 @@ def clear_autofill() -> None:
 
 
 def set_add_form_from_existing(row: pd.Series) -> None:
-    """
-    Load an existing inventory record into the Add/Receive form state
-    so the user can correct/update without retyping.
-    """
     st.session_state["add_upc_raw"] = row.get("upc", "")
     st.session_state["add_brand"] = row.get("brand", "")
     st.session_state["add_product_name"] = row.get("product_name", "")
@@ -323,7 +310,6 @@ def set_add_form_from_existing(row: pd.Series) -> None:
     st.session_state["add_handle"] = row.get("contact_handle", "")
     st.session_state["add_notes"] = row.get("notes", "")
 
-    # Keep existing fragrance metadata in autofill state too
     st.session_state["af_fragrance_url"] = row.get("fragrance_url", "")
     st.session_state["af_country"] = row.get("country", "")
     st.session_state["af_gender"] = row.get("gender", "")
@@ -362,7 +348,6 @@ def update_existing_by_upc(
         if k in df.columns:
             df.at[idx, k] = "" if v is None else str(v)
 
-    # Normalize booleans + recompute status
     for col in ["tiktok_posted", "instagram_posted", "amazon_posted"]:
         df.at[idx, col] = normalize_bool01(df.at[idx, col])
 
@@ -393,12 +378,10 @@ with st.sidebar:
     catalog_path = st.text_input("Catalog CSV path", value=DEFAULT_CATALOG_CSV)
     st.caption("Uses the cleaned dataset file stored in your repo.")
 
-
 samples_df = load_samples(samples_path)
 catalog_df = load_catalog(catalog_path)
 ensure_activity_log(activity_log_path)
 
-# Seed activity log state from file if empty
 if "activity_log" not in st.session_state:
     try:
         st.session_state["activity_log"] = pd.read_csv(activity_log_path, dtype=str).fillna("").tail(200).to_dict("records")
@@ -435,7 +418,6 @@ with q3:
         "If it exists, you will see exactly which record matched."
     )
 
-# Find exact matches
 scan_hits = get_upc_row_indexes(samples_df, scan_upc_norm)
 
 if scan_upc_raw and not scan_upc_norm:
@@ -445,7 +427,6 @@ elif scan_upc_norm and not scan_hits:
 elif scan_upc_norm and scan_hits:
     st.success(f"UPC found ({len(scan_hits)} match). You can edit it in **Inventory** or update it in **Content Queue**.")
 
-# Filter view
 filtered_df = samples_df.copy()
 if search_text:
     q = search_text.lower()
@@ -459,7 +440,6 @@ if search_text:
         filtered_df["notes"]
     ).str.lower()
     filtered_df = filtered_df[hay.str.contains(q, na=False)].copy()
-
 
 tab_dash, tab_add, tab_queue, tab_inventory, tab_catalog, tab_log = st.tabs(
     ["Dashboard", "Add / Receive", "Content Queue", "Inventory", "Catalog Browser", "Activity Log"]
@@ -512,7 +492,7 @@ with tab_dash:
 # ----------------------------
 with tab_add:
     st.subheader("Add / Receive")
-    st.caption("This is your guided flow. Pick a fragrance (autofill), scan UPC, save. If a UPC conflict happens, you will see why and can fix it without losing what you entered.")
+    st.caption("Pick a fragrance (autofill), scan UPC, save. If a UPC conflict happens, you can inspect and fix it without losing what you entered.")
 
     left, right = st.columns([1.05, 1])
 
@@ -533,15 +513,21 @@ with tab_add:
             if brand_filter:
                 brands = [b for b in brands if brand_filter in b.lower()]
 
+            if not brands:
+                st.info("No brands match your filter. Try fewer words, or clear the brand filter.")
+                st.stop()
+
             selected_brand = st.selectbox(
                 "Brand",
                 options=brands,
-                index=0 if brands else 0,
                 format_func=pretty_slug,
                 key="catalog_brand_select"
             )
 
             brand_df = catalog_df[catalog_df["brand"] == selected_brand].copy()
+            if brand_df.empty:
+                st.info("That brand has no perfumes in the dataset. Try another brand.")
+                st.stop()
 
             perfume_filter = st.text_input(
                 "Perfume filter (optional)",
@@ -554,14 +540,22 @@ with tab_add:
             if perfume_filter:
                 perfumes = [p for p in perfumes if perfume_filter in p.lower()]
 
+            if not perfumes:
+                st.info("No perfumes match your filter for this brand. Clear the perfume filter or try fewer words.")
+                st.stop()
+
             selected_perfume_display = st.selectbox(
                 "Perfume",
                 options=perfumes,
-                index=0 if perfumes else 0,
                 key="catalog_perfume_select"
             )
 
-            picked_row = brand_df[brand_df["perfume_display"] == selected_perfume_display].iloc[0].to_dict()
+            picked_df = brand_df[brand_df["perfume_display"] == selected_perfume_display].copy()
+            if picked_df.empty:
+                st.info("That perfume selection was not found. Please reselect.")
+                st.stop()
+
+            picked_row = picked_df.iloc[0].to_dict()
 
             cta1, cta2 = st.columns([1, 1])
             with cta1:
@@ -598,12 +592,10 @@ with tab_add:
         st.markdown("### Step 2: Scan UPC, confirm, and save")
         st.caption("This writes to samples.csv. If the UPC conflicts, you will see the exact existing record and can update it.")
 
-        # Prefill UPC from top scan if not found
         default_upc_raw = st.session_state.get("add_upc_raw", "")
         if scan_upc_raw and not get_upc_row_indexes(samples_df, scan_upc_norm):
             default_upc_raw = scan_upc_raw
 
-        # Persist form entries in session_state so errors do not wipe them
         st.session_state.setdefault("add_upc_raw", default_upc_raw)
         st.session_state.setdefault("add_brand", st.session_state.get("af_brand", ""))
         st.session_state.setdefault("add_product_name", st.session_state.get("af_product_name", ""))
@@ -623,8 +615,6 @@ with tab_add:
             received = r2.date_input("Received date", value=date.today())
 
             r3, r4 = st.columns(2)
-
-            # If autofill exists and user hasn't typed, keep it helpful
             if not st.session_state.get("add_brand"):
                 st.session_state["add_brand"] = st.session_state.get("af_brand", "")
             if not st.session_state.get("add_product_name"):
@@ -655,7 +645,6 @@ with tab_add:
 
             submitted = st.form_submit_button("Save to inventory", type="primary")
 
-        # After form block: validate + handle conflicts without losing form state
         if submitted:
             if not add_upc_norm:
                 log_event(activity_log_path, "ADD_FAIL", add_upc_raw, add_upc_norm, "UPC missing or contained no digits.")
@@ -663,7 +652,6 @@ with tab_add:
             else:
                 hits = get_upc_row_indexes(samples_df, add_upc_norm)
                 if hits:
-                    # Conflict: show why, show matching records, allow fix/update
                     log_event(activity_log_path, "UPC_CONFLICT", add_upc_raw, add_upc_norm, f"UPC matched {len(hits)} existing row(s).")
                     st.error("That UPC already exists in your inventory.")
 
@@ -679,7 +667,6 @@ with tab_add:
                         ]].copy()
                         st.dataframe(match_df, use_container_width=True, hide_index=True)
 
-                        # Near matches can explain "I swear it doesn't exist"
                         near = samples_df[samples_df["upc"].str.contains(add_upc_norm[:6], na=False)].head(20)
                         if len(near) > 0:
                             st.caption("Possible near matches (shares first 6 digits):")
@@ -693,14 +680,12 @@ with tab_add:
 
                     with fix1:
                         if st.button("Load existing into this form"):
-                            # Load first matching record into the form without losing it
                             set_add_form_from_existing(samples_df.iloc[hits[0]])
-                            st.info("Loaded the existing record into the form. Adjust fields and then use Inventory to save edits, or use Update Existing below.")
+                            st.info("Loaded the existing record into the form.")
                             st.rerun()
 
                     with fix2:
                         if st.button("Update existing with current form values", type="primary"):
-                            # Update only the 'safe' fields + fragrance metadata association
                             updates = {
                                 "brand": add_brand.strip(),
                                 "product_name": add_name.strip(),
@@ -711,7 +696,6 @@ with tab_add:
                                 "received_date": str(received),
                                 "notes": add_notes.strip(),
 
-                                # (re)associate fragrance metadata from current autofill
                                 "fragrance_url": st.session_state.get("af_fragrance_url", ""),
                                 "country": st.session_state.get("af_country", ""),
                                 "gender": st.session_state.get("af_gender", ""),
@@ -740,17 +724,14 @@ with tab_add:
                                 st.error(str(e))
 
                     with fix3:
-                        st.caption("If your scanner is adding extra characters, the debug section shows what the app normalized to. Only digits are used for matching.")
+                        st.caption("Only digits are used for UPC matching. Debug shows what was normalized.")
 
                 else:
-                    # Create new record
                     row = {k: "" for k in SAMPLES_FIELDS}
-
                     row["upc"] = add_upc_norm
                     row["brand"] = add_brand.strip()
                     row["product_name"] = add_name.strip()
                     row["variant"] = add_variant.strip()
-
                     row["source_shipper"] = add_shipper.strip()
                     row["contact_handle"] = add_handle.strip()
                     row["received_date"] = str(received)
@@ -761,7 +742,6 @@ with tab_add:
                     row["instagram_posted"] = "0"
                     row["amazon_posted"] = "0"
 
-                    # catalog autofill association
                     row["fragrance_url"] = st.session_state.get("af_fragrance_url", "")
                     row["country"] = st.session_state.get("af_country", "")
                     row["gender"] = st.session_state.get("af_gender", "")
@@ -790,10 +770,8 @@ with tab_add:
                     samples_df = pd.concat([samples_df, pd.DataFrame([row])], ignore_index=True)
                     save_samples(samples_df, samples_path)
                     log_event(activity_log_path, "ADD_SUCCESS", add_upc_raw, add_upc_norm, "Added new inventory row.")
-
                     st.success("Saved. Your inventory CSV has been updated.")
 
-                    # Clear the form only on success (not on errors)
                     st.session_state["add_upc_raw"] = ""
                     st.session_state["add_brand"] = st.session_state.get("af_brand", "")
                     st.session_state["add_product_name"] = st.session_state.get("af_product_name", "")
@@ -802,10 +780,8 @@ with tab_add:
                     st.session_state["add_shipper"] = ""
                     st.session_state["add_handle"] = ""
                     st.session_state["add_notes"] = ""
-
                     st.rerun()
 
-        # Manual reset button (safe)
         if st.button("Reset form (does not delete inventory)"):
             st.session_state["add_upc_raw"] = ""
             st.session_state["add_brand"] = st.session_state.get("af_brand", "")
@@ -863,26 +839,25 @@ with tab_queue:
     qa_upc_norm = normalize_upc(qa_upc_raw)
 
     def quick_update(updates: Dict[str, str], action_name: str):
-        nonlocal_df = None  # just to make intent obvious; not used
         try:
-            samples_df_local = samples_df.copy()
-            hits = get_upc_row_indexes(samples_df_local, qa_upc_norm)
+            df_local = samples_df.copy()
+            hits = get_upc_row_indexes(df_local, qa_upc_norm)
             if not qa_upc_norm:
                 raise ValueError("UPC is required.")
             if not hits:
                 raise KeyError("UPC not found.")
             idx = hits[0]
             for k, v in updates.items():
-                if k in samples_df_local.columns:
-                    samples_df_local.at[idx, k] = v
+                if k in df_local.columns:
+                    df_local.at[idx, k] = v
 
             for col in ["tiktok_posted", "instagram_posted", "amazon_posted"]:
-                samples_df_local.at[idx, col] = normalize_bool01(samples_df_local.at[idx, col])
+                df_local.at[idx, col] = normalize_bool01(df_local.at[idx, col])
 
-            samples_df_local.at[idx, "status"] = compute_status(samples_df_local.loc[idx], track_amazon)
-            samples_df_local.at[idx, "last_updated"] = now_str()
+            df_local.at[idx, "status"] = compute_status(df_local.loc[idx], track_amazon)
+            df_local.at[idx, "last_updated"] = now_str()
 
-            save_samples(samples_df_local, samples_path)
+            save_samples(df_local, samples_path)
             log_event(activity_log_path, action_name, qa_upc_raw, qa_upc_norm, "Quick action applied.")
             st.success("Updated and saved.")
             st.rerun()
@@ -918,7 +893,6 @@ with tab_inventory:
     st.caption("Edit directly, then save. UPCs are normalized to digits-only.")
 
     view_df = filtered_df.copy()
-
     if scan_upc_norm and scan_hits:
         view_df = samples_df.iloc[scan_hits].copy()
 
@@ -934,7 +908,6 @@ with tab_inventory:
         if st.button("Save changes", type="primary"):
             updated = samples_df.copy()
 
-            # Build map by normalized UPC
             edited_map = {}
             for _, r in edited.iterrows():
                 u = normalize_upc(r.get("upc", ""))
@@ -948,7 +921,6 @@ with tab_inventory:
                         val = edited_map[u].get(col, "")
                         updated.at[i, col] = "" if pd.isna(val) else str(val)
 
-            # Normalize and recompute
             updated["upc"] = updated["upc"].astype(str).apply(normalize_upc)
             for i in range(len(updated)):
                 updated.at[i, "tiktok_posted"] = normalize_bool01(updated.at[i, "tiktok_posted"])
@@ -957,8 +929,7 @@ with tab_inventory:
                 updated.at[i, "status"] = compute_status(updated.loc[i], track_amazon)
                 updated.at[i, "last_updated"] = now_str()
 
-            samples_df = updated
-            save_samples(samples_df, samples_path)
+            save_samples(updated, samples_path)
             log_event(activity_log_path, "INVENTORY_SAVE", "", "", "Saved edits from Inventory.")
             st.success("Saved to CSV.")
             st.rerun()
@@ -1041,8 +1012,7 @@ with tab_log:
     if not log_rows:
         st.write("No activity logged yet.")
     else:
-        df_log = pd.DataFrame(log_rows)
-        df_log = df_log.tail(200).iloc[::-1]  # newest first
+        df_log = pd.DataFrame(log_rows).tail(200).iloc[::-1]
         st.dataframe(df_log, use_container_width=True, hide_index=True)
 
     st.download_button(
